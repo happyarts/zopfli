@@ -1,5 +1,9 @@
 use alloc::vec::Vec;
+#[cfg(feature = "std")]
+use core::num::NonZeroUsize;
 use core::{cmp, iter};
+#[cfg(feature = "std")]
+use std::sync::{Mutex, PoisonError};
 
 #[cfg(feature = "std")]
 use log::{debug, log_enabled};
@@ -39,6 +43,14 @@ pub struct DeflateEncoder<W: Write> {
     chunk_start: usize,
     window_and_chunk: Vec<u8>,
     bitwise_writer: Option<BitwiseWriter<W>>,
+    /// See [`with_threads`](Self::with_threads).
+    #[cfg(feature = "std")]
+    threads: NonZeroUsize,
+    /// With more than one thread: the chunks before the last one, worked out
+    /// on other threads. Only used through `&mut self` (`get_mut`); the mutex
+    /// keeps the encoder `Sync` and unwind safe.
+    #[cfg(feature = "std")]
+    pool: Option<Mutex<chunk_pool::ChunkPool>>,
 }
 
 impl<W: Write> DeflateEncoder<W> {
@@ -52,7 +64,72 @@ impl<W: Write> DeflateEncoder<W> {
             chunk_start: 0,
             window_and_chunk: Vec::with_capacity(ZOPFLI_WINDOW_SIZE),
             bitwise_writer: Some(BitwiseWriter::new(sink)),
+            #[cfg(feature = "std")]
+            threads: NonZeroUsize::MIN,
+            #[cfg(feature = "std")]
+            pool: None,
         }
+    }
+
+    /// Works out the chunks on up to `threads` threads at the same time. The
+    /// output is the same as with one thread, which is the default.
+    ///
+    /// Each [`write`](Write::write) makes a chunk (1,000,000 bytes with
+    /// [`compress`](crate::compress)); a chunk can only be written once the
+    /// next one shows that it is not the last. With more than one thread, such
+    /// a chunk goes to a worker thread together with the window before it,
+    /// and is written to the sink, in order, by a later `write`,
+    /// [`flush`](Write::flush) or [`finish`](Self::finish) once it is done;
+    /// the last chunk is worked out by `finish` itself. So:
+    ///
+    /// - Only inputs of several chunks gain, and only dynamic blocks are
+    ///   affected ([`BlockType::Dynamic`]).
+    /// - Worker threads are started as chunks come, up to `threads`; each one
+    ///   holds the data and the work of one chunk (a few tens of MB for a
+    ///   1 MB chunk). At most twice as many chunks as threads are held before
+    ///   a `write` waits for the oldest one. While `finish` works out the last
+    ///   chunk, the workers may still be busy, so up to `threads + 1` threads
+    ///   compute at the same time.
+    /// - Called again after threads have started, this changes how many
+    ///   chunks are held and how many more threads may start; threads already
+    ///   started keep working until the encoder is finished.
+    /// - An error of the sink can surface on a later call than the one whose
+    ///   data caused it. A `write` that returns an error has not taken any of
+    ///   its data.
+    /// - `finish`, and dropping the encoder, wait until all chunks are done.
+    ///   Dropped after a write to the sink failed, the encoder returns at
+    ///   once: the threads finish the chunk they are working on, leave the
+    ///   others and stop.
+    /// - A panic of a worker thread is resumed on the thread that writes the
+    ///   chunk; after that, the encoder only returns errors.
+    ///
+    /// Only available with the `std` feature.
+    #[cfg(feature = "std")]
+    pub fn with_threads(mut self, threads: NonZeroUsize) -> Self {
+        self.set_threads(threads);
+        self
+    }
+
+    #[cfg(feature = "std")]
+    pub(crate) fn set_threads(&mut self, threads: NonZeroUsize) {
+        self.threads = threads;
+        if let Some(pool) = self.pool_mut() {
+            pool.set_threads(threads);
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn pool_mut(&mut self) -> Option<&mut chunk_pool::ChunkPool> {
+        self.pool
+            .as_mut()
+            .map(|pool| pool.get_mut().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Whether the chunks go through the thread pool: once it is in use, all
+    /// further ones do, so that they are written in order.
+    #[cfg(feature = "std")]
+    fn uses_threads(&self) -> bool {
+        self.btype == BlockType::Dynamic && (self.threads.get() > 1 || self.pool.is_some())
     }
 
     /// Creates a new Zopfli DEFLATE encoder that operates according to the
@@ -126,12 +203,66 @@ impl<W: Write> DeflateEncoder<W> {
             return Ok(None);
         }
 
-        self.compress_chunk(true)?;
+        #[cfg(feature = "std")]
+        let pooled = self.pool.is_some();
+        #[cfg(not(feature = "std"))]
+        let pooled = false;
+        if pooled {
+            #[cfg(feature = "std")]
+            self.finish_pool()?;
+        } else {
+            self.compress_chunk(true)?;
+        }
 
         let mut bitwise_writer = self.bitwise_writer.take().unwrap();
         bitwise_writer.finish_partial_bits()?;
 
         Ok(Some(bitwise_writer.out))
+    }
+
+    /// Writes all chunks of the thread pool, and the last chunk, which is
+    /// worked out here meanwhile, as the final one.
+    #[cfg(feature = "std")]
+    fn finish_pool(&mut self) -> Result<(), Error> {
+        if let Some(pool) = self.pool_mut() {
+            pool.check()?;
+        }
+        // Without a chunk (after a write that failed), the final block is empty.
+        let start = if self.have_chunk {
+            self.chunk_start
+        } else {
+            self.window_and_chunk.len()
+        };
+        let (lz77, splitpoints) = blocksplit_plan(
+            &self.options,
+            &self.window_and_chunk,
+            start,
+            self.window_and_chunk.len(),
+        );
+        let bitwise_writer = self.bitwise_writer.as_mut().unwrap();
+        let pool = self
+            .pool
+            .as_mut()
+            .map(|pool| pool.get_mut().unwrap_or_else(PoisonError::into_inner));
+        if let Some(pool) = pool {
+            pool.write_all(bitwise_writer)?;
+            let written = add_all_blocks(
+                &splitpoints,
+                &lz77,
+                true,
+                &self.window_and_chunk,
+                bitwise_writer,
+            );
+            pool.set_failed(written.is_err());
+            return written;
+        }
+        add_all_blocks(
+            &splitpoints,
+            &lz77,
+            true,
+            &self.window_and_chunk,
+            bitwise_writer,
+        )
     }
 
     /// Gets a reference to the underlying writer.
@@ -150,6 +281,32 @@ impl<W: Write> DeflateEncoder<W> {
 
 impl<W: Write> Write for DeflateEncoder<W> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
+        #[cfg(feature = "std")]
+        if self.uses_threads() {
+            if self.have_chunk {
+                // The previous chunk is not the last: it goes to a worker, and its
+                // end stays as the window of this one.
+                let data = core::mem::take(&mut self.window_and_chunk);
+                self.window_and_chunk
+                    .extend_from_slice(&data[data.len().saturating_sub(ZOPFLI_WINDOW_SIZE)..]);
+                self.have_chunk = false;
+                let (options, threads) = (self.options, self.threads);
+                self.pool
+                    .get_or_insert_with(|| Mutex::new(chunk_pool::ChunkPool::new(options, threads)))
+                    .get_mut()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .submit(data, self.chunk_start);
+            }
+            let bitwise_writer = self.bitwise_writer.as_mut().unwrap();
+            if let Some(pool) = self.pool.as_mut() {
+                pool.get_mut()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .write_finished(bitwise_writer)?;
+            }
+            self.set_chunk(buf);
+            return Ok(buf.len());
+        }
+
         // Any previous chunk is known to be non-last at this point,
         // so compress it now
         if self.have_chunk {
@@ -164,12 +321,27 @@ impl<W: Write> Write for DeflateEncoder<W> {
     }
 
     fn flush(&mut self) -> Result<(), Error> {
+        #[cfg(feature = "std")]
+        {
+            let bitwise_writer = self.bitwise_writer.as_mut().unwrap();
+            if let Some(pool) = self.pool.as_mut() {
+                pool.get_mut()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .write_finished(bitwise_writer)?;
+            }
+        }
         self.bitwise_writer.as_mut().unwrap().out.flush()
     }
 }
 
 impl<W: Write> Drop for DeflateEncoder<W> {
     fn drop(&mut self) {
+        // After the sink failed or a thread panicked, the chunks still queued
+        // for the threads are left out rather than worked out for nothing.
+        #[cfg(feature = "std")]
+        if self.pool_mut().is_some_and(|pool| pool.failed()) {
+            return;
+        }
         self.__finish().ok();
     }
 }
@@ -1177,6 +1349,18 @@ fn blocksplit_attempt<W: Write>(
     inend: usize,
     bitwise_writer: &mut BitwiseWriter<W>,
 ) -> Result<(), Error> {
+    let (lz77, splitpoints) = blocksplit_plan(options, in_data, instart, inend);
+    add_all_blocks(&splitpoints, &lz77, final_block, in_data, bitwise_writer)
+}
+
+/// The LZ77 data of `instart..inend` and the LZ77 indices where
+/// `blocksplit_attempt` splits it into blocks.
+fn blocksplit_plan(
+    options: &Options,
+    in_data: &[u8],
+    instart: usize,
+    inend: usize,
+) -> (Lz77Store, Vec<usize>) {
     let mut totalcost = 0.0;
     let mut lz77 = Lz77Store::new();
 
@@ -1249,7 +1433,7 @@ fn blocksplit_attempt<W: Write>(
         }
     }
 
-    add_all_blocks(&splitpoints, &lz77, final_block, in_data, bitwise_writer)
+    (lz77, splitpoints)
 }
 
 /// Since an uncompressed block can be max 65535 in size, it actually adds
@@ -1440,5 +1624,268 @@ mod test {
         encoder
             .finish()
             .expect_err("Flushing the pending buffer to the stream should fail gracefully");
+    }
+}
+
+/// A chunk that starts with these bytes makes the thread working on it panic.
+#[cfg(all(test, feature = "std"))]
+pub(crate) const TEST_PANIC: &[u8] = b"zopfli test: panic in the thread of this chunk";
+
+/// Works out the LZ77 data and block splits of an encoder's chunks on worker
+/// threads, for [`DeflateEncoder::with_threads`]. Each chunk is handed over
+/// with the window before it, so the plans are the ones the encoder would make
+/// itself; the encoder's thread writes them in order.
+#[cfg(feature = "std")]
+mod chunk_pool {
+    use std::{
+        collections::BTreeMap,
+        num::NonZeroUsize,
+        panic::{self, AssertUnwindSafe},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc, Mutex,
+        },
+        thread,
+    };
+
+    use super::{add_all_blocks, blocksplit_plan, BitwiseWriter};
+    use crate::{lz77::Lz77Store, Error, Options, Write};
+
+    /// A chunk: the window before it and the chunk itself, and where the chunk
+    /// starts in that data.
+    struct Job {
+        index: usize,
+        data: Vec<u8>,
+        instart: usize,
+    }
+
+    /// A chunk with its LZ77 data and split points, or the panic of the thread
+    /// that worked on it.
+    struct Done {
+        data: Vec<u8>,
+        plan: thread::Result<(Lz77Store, Vec<usize>)>,
+    }
+
+    fn work_out(options: &Options, job: Job) -> (usize, Done) {
+        let plan = panic::catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if job.data[job.instart..].starts_with(super::TEST_PANIC) {
+                panic!("test panic in a worker");
+            }
+            blocksplit_plan(options, &job.data, job.instart, job.data.len())
+        }));
+        (
+            job.index,
+            Done {
+                data: job.data,
+                plan,
+            },
+        )
+    }
+
+    pub struct ChunkPool {
+        options: Options,
+        threads: usize,
+        jobs: mpsc::Sender<Job>,
+        queue: Arc<Mutex<mpsc::Receiver<Job>>>,
+        done_sender: mpsc::Sender<(usize, Done)>,
+        done: mpsc::Receiver<(usize, Done)>,
+        /// Set when the pool is dropped: the workers leave the chunks still
+        /// queued and stop.
+        cancelled: Arc<AtomicBool>,
+        workers: usize,
+        /// Chunks handed over, chunks written, and finished ones not written yet.
+        submitted: usize,
+        written: usize,
+        finished: BTreeMap<usize, Done>,
+        /// The last attempt to write a chunk failed.
+        failed: bool,
+        /// A worker panicked: nothing more is written.
+        poisoned: bool,
+    }
+
+    impl ChunkPool {
+        pub fn new(options: Options, threads: NonZeroUsize) -> Self {
+            let (jobs, queue) = mpsc::channel();
+            let (done_sender, done) = mpsc::channel();
+            Self {
+                options,
+                threads: threads.get(),
+                jobs,
+                queue: Arc::new(Mutex::new(queue)),
+                done_sender,
+                done,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                workers: 0,
+                submitted: 0,
+                written: 0,
+                finished: BTreeMap::new(),
+                failed: false,
+                poisoned: false,
+            }
+        }
+
+        pub fn set_threads(&mut self, threads: NonZeroUsize) {
+            self.threads = threads.get();
+        }
+
+        /// Whether the last attempt to write to the sink failed, or a worker
+        /// panicked.
+        pub fn failed(&self) -> bool {
+            self.failed || self.poisoned
+        }
+
+        pub fn set_failed(&mut self, failed: bool) {
+            self.failed = failed;
+        }
+
+        /// An error once a worker has panicked.
+        pub fn check(&self) -> Result<(), Error> {
+            if self.poisoned {
+                return Err(Error::other("a zopfli worker thread panicked"));
+            }
+            Ok(())
+        }
+
+        /// Hands a chunk over: `data` holds the window before it and the chunk
+        /// from `instart` on. Starts a worker while there are fewer than threads
+        /// and than chunks not written yet.
+        pub fn submit(&mut self, data: Vec<u8>, instart: usize) {
+            let job = Job {
+                index: self.submitted,
+                data,
+                instart,
+            };
+            self.submitted += 1;
+            if self.workers < self.threads
+                && self.workers < self.submitted - self.written
+                && self.start_worker()
+            {
+                self.workers += 1;
+            }
+            // Without a worker (none could be started), this thread works it out.
+            let job = if self.workers > 0 {
+                match self.jobs.send(job) {
+                    Ok(()) => return,
+                    Err(mpsc::SendError(job)) => job,
+                }
+            } else {
+                job
+            };
+            let (index, done) = work_out(&self.options, job);
+            self.finished.insert(index, done);
+        }
+
+        fn start_worker(&self) -> bool {
+            let queue = Arc::clone(&self.queue);
+            let done = self.done_sender.clone();
+            let cancelled = Arc::clone(&self.cancelled);
+            let options = self.options;
+            thread::Builder::new()
+                .name("zopfli".into())
+                .spawn(move || loop {
+                    let job = match queue.lock() {
+                        Ok(queue) => queue.recv(),
+                        Err(_) => return,
+                    };
+                    let Ok(job) = job else { return };
+                    if cancelled.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    if done.send(work_out(&options, job)).is_err() {
+                        return;
+                    }
+                })
+                .is_ok()
+        }
+
+        /// Takes the chunks that have finished meanwhile.
+        fn collect(&mut self) {
+            while let Ok((index, done)) = self.done.try_recv() {
+                self.finished.insert(index, done);
+            }
+        }
+
+        /// Waits until the chunk `index` is among the finished ones.
+        fn wait_for(&mut self, index: usize) {
+            while !self.finished.contains_key(&index) {
+                // The pool holds a sender of `done` itself, so this only waits:
+                // every chunk handed over is queued, with a worker or finished.
+                if let Ok((i, done)) = self.done.recv() {
+                    self.finished.insert(i, done);
+                }
+            }
+        }
+
+        /// Writes the chunks that have finished, in order; while more than
+        /// twice as many chunks as threads are not written, waits for the
+        /// oldest one.
+        pub fn write_finished<W: Write>(
+            &mut self,
+            bitwise_writer: &mut BitwiseWriter<W>,
+        ) -> Result<(), Error> {
+            self.check()?;
+            loop {
+                self.collect();
+                if self.written == self.submitted {
+                    return Ok(());
+                }
+                if !self.finished.contains_key(&self.written) {
+                    if self.submitted - self.written <= self.threads.saturating_mul(2) {
+                        return Ok(());
+                    }
+                    self.wait_for(self.written);
+                }
+                self.write_next(bitwise_writer)?;
+            }
+        }
+
+        /// Writes every chunk handed over, waiting for those not finished.
+        pub fn write_all<W: Write>(
+            &mut self,
+            bitwise_writer: &mut BitwiseWriter<W>,
+        ) -> Result<(), Error> {
+            self.check()?;
+            while self.written < self.submitted {
+                self.wait_for(self.written);
+                self.write_next(bitwise_writer)?;
+            }
+            Ok(())
+        }
+
+        /// Writes the chunk `written`, which has finished. It stays until it is
+        /// written, so that a write that fails leaves it in place.
+        fn write_next<W: Write>(
+            &mut self,
+            bitwise_writer: &mut BitwiseWriter<W>,
+        ) -> Result<(), Error> {
+            if self.finished[&self.written].plan.is_err() {
+                // The panic of the worker goes on here, as it would have without
+                // threads (also when this runs from `Drop`). Its chunk is gone, so
+                // nothing after it can be written any more.
+                self.poisoned = true;
+                if let Some(Done {
+                    plan: Err(payload), ..
+                }) = self.finished.remove(&self.written)
+                {
+                    panic::resume_unwind(payload);
+                }
+            }
+            let next = &self.finished[&self.written];
+            if let Ok((lz77, splitpoints)) = &next.plan {
+                let written = add_all_blocks(splitpoints, lz77, false, &next.data, bitwise_writer);
+                self.failed = written.is_err();
+                written?;
+            }
+            self.finished.remove(&self.written);
+            self.written += 1;
+            Ok(())
+        }
+    }
+
+    impl Drop for ChunkPool {
+        fn drop(&mut self) {
+            self.cancelled.store(true, Ordering::Relaxed);
+        }
     }
 }

@@ -411,4 +411,237 @@ mod test {
             assert!(ours == theirs, "fixed blocks of {} bytes", data.len());
         }
     }
+
+    /// The output of a `DeflateEncoder` with `threads` for `data` written in
+    /// the pieces that end at `cuts`.
+    fn deflate_in_pieces(threads: usize, iterations: u64, data: &[u8], cuts: &[usize]) -> Vec<u8> {
+        let options = Options {
+            iteration_count: NonZeroU64::new(iterations).unwrap(),
+            ..Options::default()
+        };
+        let mut out = Vec::new();
+        let mut encoder = DeflateEncoder::new(options, BlockType::Dynamic, &mut out)
+            .with_threads(core::num::NonZeroUsize::new(threads).unwrap());
+        // The same pieces each time, empty ones included.
+        let mut last = 0;
+        for &cut in cuts.iter().chain(core::iter::once(&data.len())) {
+            assert_eq!(
+                io::Write::write(&mut encoder, &data[last..cut]).unwrap(),
+                cut - last
+            );
+            last = cut;
+        }
+        encoder.finish().unwrap();
+        out
+    }
+
+    proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(24))]
+        #[test]
+        fn threads_do_not_change_the_output(
+            threads in 2..5usize,
+            iterations in 1..3u64,
+            cuts in prop::collection::vec(0..=1024usize, 0..10),
+            runs in prop::collection::vec((0..6u8, 1..3000usize), 0..100),
+        ) {
+            let data: Vec<u8> = runs
+                .iter()
+                .flat_map(|&(b, n)| core::iter::repeat_n(b, n))
+                .collect();
+            let mut cuts: Vec<usize> = cuts.iter().map(|&c| c * data.len() / 1024).collect();
+            cuts.sort_unstable();
+            prop_assert!(
+                deflate_in_pieces(threads, iterations, &data, &cuts)
+                    == deflate_in_pieces(1, iterations, &data, &cuts)
+            );
+        }
+    }
+
+    #[test]
+    fn threads_in_gzip_and_zlib_do_not_change_the_output() {
+        let data: Vec<u8> = (0..120_000u32).map(|i| (i / 700 % 7) as u8 * 3).collect();
+        let options = Options {
+            iteration_count: NonZeroU64::new(1).unwrap(),
+            ..Options::default()
+        };
+        let threads = core::num::NonZeroUsize::new(3).unwrap();
+        #[cfg(feature = "gzip")]
+        {
+            let gzip = |threads| {
+                let mut out = Vec::new();
+                let mut encoder = GzipEncoder::new(options, BlockType::Dynamic, &mut out)
+                    .unwrap()
+                    .with_threads(threads);
+                for piece in data.chunks(10_000) {
+                    io::Write::write_all(&mut encoder, piece).unwrap();
+                }
+                encoder.finish().unwrap();
+                out
+            };
+            assert!(gzip(threads) == gzip(core::num::NonZeroUsize::MIN));
+        }
+        #[cfg(feature = "zlib")]
+        {
+            let zlib = |threads| {
+                let mut out = Vec::new();
+                let mut encoder = ZlibEncoder::new(options, BlockType::Dynamic, &mut out)
+                    .unwrap()
+                    .with_threads(threads);
+                for piece in data.chunks(10_000) {
+                    io::Write::write_all(&mut encoder, piece).unwrap();
+                }
+                encoder.finish().unwrap();
+                out
+            };
+            assert!(zlib(threads) == zlib(core::num::NonZeroUsize::MIN));
+        }
+        let _ = (options, threads, &data);
+    }
+
+    /// A sink that fails once `room` bytes are written.
+    struct Failing {
+        room: usize,
+    }
+
+    impl io::Write for Failing {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.len() > self.room {
+                return Err(io::Error::other("full"));
+            }
+            self.room -= buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn threads_report_a_failing_sink() {
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i / 300 % 5) as u8).collect();
+        let options = Options {
+            iteration_count: NonZeroU64::new(1).unwrap(),
+            ..Options::default()
+        };
+        let threads = core::num::NonZeroUsize::new(2).unwrap();
+        let full_size = deflate_in_pieces(
+            1,
+            1,
+            &data,
+            &(1..30).map(|i| i * 10_000).collect::<Vec<_>>(),
+        )
+        .len();
+        for room in [0, 50, 500, full_size / 2, full_size - 1, full_size] {
+            let mut encoder = DeflateEncoder::new(options, BlockType::Dynamic, Failing { room })
+                .with_threads(threads);
+            let mut failed = false;
+            for piece in data.chunks(10_000) {
+                // A write that fails has not taken its data: the same piece again.
+                if io::Write::write(&mut encoder, piece).is_err() {
+                    failed = true;
+                    assert!(io::Write::write(&mut encoder, piece).is_err());
+                    break;
+                }
+            }
+            if failed {
+                // Dropped after an error: neither a panic nor waiting for the
+                // queued chunks.
+                drop(encoder);
+            } else {
+                failed = encoder.finish().is_err();
+            }
+            assert_eq!(failed, room < full_size, "room {room} of {full_size}");
+        }
+    }
+
+    #[test]
+    fn encoders_are_send_sync_and_unwind_safe() {
+        fn check<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        check::<DeflateEncoder<Vec<u8>>>();
+        #[cfg(feature = "gzip")]
+        check::<GzipEncoder<Vec<u8>>>();
+        #[cfg(feature = "zlib")]
+        check::<ZlibEncoder<Vec<u8>>>();
+    }
+
+    #[test]
+    fn changing_threads_between_writes_does_not_change_the_output() {
+        let data: Vec<u8> = (0..400_000u32).map(|i| (i / 900 % 6) as u8 * 5).collect();
+        let options = Options {
+            iteration_count: NonZeroU64::new(1).unwrap(),
+            ..Options::default()
+        };
+        let compress = |threads: [usize; 3]| {
+            let mut out = Vec::new();
+            let mut encoder = DeflateEncoder::new(options, BlockType::Dynamic, &mut out);
+            for (k, piece) in data.chunks(40_000).enumerate() {
+                if k % 4 == 0 {
+                    let n = core::num::NonZeroUsize::new(threads[k / 4 % 3]).unwrap();
+                    encoder = encoder.with_threads(n);
+                }
+                io::Write::write_all(&mut encoder, piece).unwrap();
+            }
+            encoder.finish().unwrap();
+            out
+        };
+        let expected = compress([1, 1, 1]);
+        for threads in [[1, 4, 1], [4, 1, 4], [2, usize::MAX, 1]] {
+            assert!(compress(threads) == expected, "threads {threads:?}");
+        }
+    }
+
+    /// Runs `f` on a thread of its own; fails if it panics or takes more than
+    /// a minute.
+    fn within_a_minute(f: impl FnOnce() + Send + 'static) {
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let _ = done.send(result.is_ok());
+        });
+        let finished = wait.recv_timeout(std::time::Duration::from_secs(60));
+        assert_eq!(finished, Ok(true), "failed or still running after a minute");
+    }
+
+    #[test]
+    fn a_panic_in_a_worker_reaches_the_caller_and_nothing_waits_for_it() {
+        within_a_minute(|| {
+            let options = Options {
+                iteration_count: NonZeroU64::new(1).unwrap(),
+                ..Options::default()
+            };
+            let mut first = deflate::TEST_PANIC.to_vec();
+            first.resize(30_000, 7);
+            let other = vec![3; 30_000];
+            // More chunks than two threads hold: a write waits for the first
+            // chunk and meets the panic.
+            let pieces = || core::iter::once(&first).chain(core::iter::repeat_n(&other, 8));
+            let threads = core::num::NonZeroUsize::new(2).unwrap();
+            let is_test_panic = |payload: Box<dyn core::any::Any + Send>| {
+                payload.downcast_ref::<&str>() == Some(&"test panic in a worker")
+            };
+
+            // Caught, then finished: an error.
+            let mut encoder =
+                DeflateEncoder::new(options, BlockType::Dynamic, Vec::new()).with_threads(threads);
+            let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                for piece in pieces() {
+                    io::Write::write_all(&mut encoder, piece).unwrap();
+                }
+            }));
+            assert!(is_test_panic(written.unwrap_err()));
+            assert!(io::Write::write_all(&mut encoder, &other).is_err());
+            assert!(encoder.finish().is_err());
+
+            // Not caught: the encoder is dropped while the panic unwinds.
+            let dropped = std::panic::catch_unwind(|| {
+                let mut encoder = DeflateEncoder::new(options, BlockType::Dynamic, Vec::new())
+                    .with_threads(threads);
+                for piece in pieces() {
+                    io::Write::write_all(&mut encoder, piece).unwrap();
+                }
+            });
+            assert!(is_test_panic(dropped.unwrap_err()));
+        });
+    }
 }
