@@ -151,6 +151,10 @@ pub enum Format {
 
 /// Compresses data from a source with the Zopfli algorithm, using the specified
 /// options, and writes the result to a sink in the defined output format.
+///
+/// The input is compressed in master blocks of 1,000,000 bytes, as
+/// `ZopfliCompress` of the original Zopfli does, however many bytes each
+/// `read` of `in_data` returns.
 #[cfg(feature = "std")]
 pub fn compress<R: std::io::Read, W: Write>(
     options: Options,
@@ -161,21 +165,48 @@ pub fn compress<R: std::io::Read, W: Write>(
     match output_format {
         #[cfg(feature = "gzip")]
         Format::Gzip => {
-            let mut gzip_encoder = GzipEncoder::new_buffered(options, BlockType::Dynamic, out)?;
-            std::io::copy(&mut in_data, &mut gzip_encoder)?;
-            gzip_encoder.into_inner()?.finish().map(|_| ())
+            let mut gzip_encoder = GzipEncoder::new(options, BlockType::Dynamic, out)?;
+            copy_in_master_blocks(&mut in_data, &mut gzip_encoder)?;
+            gzip_encoder.finish().map(|_| ())
         }
         #[cfg(feature = "zlib")]
         Format::Zlib => {
-            let mut zlib_encoder = ZlibEncoder::new_buffered(options, BlockType::Dynamic, out)?;
-            std::io::copy(&mut in_data, &mut zlib_encoder)?;
-            zlib_encoder.into_inner()?.finish().map(|_| ())
+            let mut zlib_encoder = ZlibEncoder::new(options, BlockType::Dynamic, out)?;
+            copy_in_master_blocks(&mut in_data, &mut zlib_encoder)?;
+            zlib_encoder.finish().map(|_| ())
         }
         Format::Deflate => {
-            let mut deflate_encoder =
-                DeflateEncoder::new_buffered(options, BlockType::Dynamic, out);
-            std::io::copy(&mut in_data, &mut deflate_encoder)?;
-            deflate_encoder.into_inner()?.finish().map(|_| ())
+            let mut deflate_encoder = DeflateEncoder::new(options, BlockType::Dynamic, out);
+            copy_in_master_blocks(&mut in_data, &mut deflate_encoder)?;
+            deflate_encoder.finish().map(|_| ())
+        }
+    }
+}
+
+/// Copies `reader` to `writer` in pieces of `ZOPFLI_MASTER_BLOCK_SIZE` bytes
+/// (the last one may be shorter), whatever amounts `reader` hands out at a
+/// time. The encoders compress each write as a chunk of its own, so this makes
+/// the output independent of the reader and splits the input into the same
+/// master blocks as the original Zopfli.
+#[cfg(feature = "std")]
+fn copy_in_master_blocks<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let mut buffer = vec![0; util::ZOPFLI_MASTER_BLOCK_SIZE];
+    loop {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            match reader.read(&mut buffer[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        writer.write_all(&buffer[..filled])?;
+        if filled < buffer.len() {
+            return Ok(());
         }
     }
 }
@@ -213,5 +244,44 @@ mod test {
             let decompressed_data = inflate::decompress_to_vec(&compressed_data).expect("Could not inflate compressed stream");
             prop_assert_eq!(data, decompressed_data, "Decompressed data should match input data");
         }
+    }
+
+    /// Hands out at most a few bytes per `read`.
+    struct Trickle<'a>(&'a [u8]);
+
+    impl io::Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = buf.len().min(self.0.len()).min(7);
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn compress_uses_master_blocks_for_every_reader() {
+        // A bit more than one master block: long runs of a few byte values.
+        let data: Vec<u8> = (0..1_100_000u32).map(|i| (i / 4999 % 5) as u8).collect();
+        let options = Options {
+            iteration_count: NonZeroU64::new(1).unwrap(),
+            ..Options::default()
+        };
+        let mut master_blocks = Vec::new();
+        let mut encoder = DeflateEncoder::new(options, BlockType::Dynamic, &mut master_blocks);
+        for block in data.chunks(1_000_000) {
+            io::Write::write_all(&mut encoder, block).unwrap();
+        }
+        encoder.finish().unwrap();
+
+        // A `&[u8]`, which `io::copy` used to hand over in one piece.
+        let mut from_slice = Vec::new();
+        compress(options, Format::Deflate, &data[..], &mut from_slice).unwrap();
+        assert!(from_slice == master_blocks, "a slice gives other chunks");
+        let mut from_trickle = Vec::new();
+        compress(options, Format::Deflate, Trickle(&data), &mut from_trickle).unwrap();
+        assert!(
+            from_trickle == master_blocks,
+            "a slow reader gives other chunks"
+        );
     }
 }
