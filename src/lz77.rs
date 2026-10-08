@@ -1,12 +1,12 @@
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use core::cmp;
 
 use crate::{
     hash::{Which, ZopfliHash},
     symbols::{get_dist_symbol, get_length_symbol},
     util::{
-        boxed_array, ZOPFLI_MAX_CHAIN_HITS, ZOPFLI_MAX_MATCH, ZOPFLI_MIN_MATCH, ZOPFLI_NUM_D,
-        ZOPFLI_NUM_LL, ZOPFLI_WINDOW_MASK, ZOPFLI_WINDOW_SIZE,
+        ZOPFLI_MAX_CHAIN_HITS, ZOPFLI_MAX_MATCH, ZOPFLI_MIN_MATCH, ZOPFLI_NUM_D, ZOPFLI_NUM_LL,
+        ZOPFLI_WINDOW_MASK, ZOPFLI_WINDOW_SIZE,
     },
 };
 
@@ -230,29 +230,21 @@ impl Lz77Store {
         }
     }
 
-    fn get_histogram_at(
-        &self,
-        lpos: usize,
-    ) -> (Box<[usize; ZOPFLI_NUM_LL]>, Box<[usize; ZOPFLI_NUM_D]>) {
-        let mut ll = boxed_array(0);
-        let mut d = boxed_array(0);
-
+    fn get_histogram_at(&self, lpos: usize) -> ([usize; ZOPFLI_NUM_LL], [usize; ZOPFLI_NUM_D]) {
         /* The real histogram is created by using the histogram for this chunk, but
         all superfluous values of this chunk subtracted. */
         let llpos = ZOPFLI_NUM_LL * (lpos / ZOPFLI_NUM_LL);
         let dpos = ZOPFLI_NUM_D * (lpos / ZOPFLI_NUM_D);
 
-        for (i, item) in ll.iter_mut().enumerate() {
-            *item = self.ll_counts[llpos + i];
-        }
+        let mut ll = [0; ZOPFLI_NUM_LL];
+        ll.copy_from_slice(&self.ll_counts[llpos..llpos + ZOPFLI_NUM_LL]);
         let end = cmp::min(llpos + ZOPFLI_NUM_LL, self.size());
         for i in (lpos + 1)..end {
             ll[self.ll_symbol[i] as usize] -= 1;
         }
 
-        for (i, item) in d.iter_mut().enumerate() {
-            *item = self.d_counts[dpos + i];
-        }
+        let mut d = [0; ZOPFLI_NUM_D];
+        d.copy_from_slice(&self.d_counts[dpos..dpos + ZOPFLI_NUM_D]);
         let end = cmp::min(dpos + ZOPFLI_NUM_D, self.size());
         for i in (lpos + 1)..end {
             if let LitLen::LengthDist(_, _) = self.litlens[i] {
@@ -270,10 +262,10 @@ impl Lz77Store {
         &self,
         lstart: usize,
         lend: usize,
-    ) -> (Box<[usize; ZOPFLI_NUM_LL]>, Box<[usize; ZOPFLI_NUM_D]>) {
+    ) -> ([usize; ZOPFLI_NUM_LL], [usize; ZOPFLI_NUM_D]) {
         if lstart + ZOPFLI_NUM_LL * 3 > lend {
-            let mut ll_counts = boxed_array(0);
-            let mut d_counts = boxed_array(0);
+            let mut ll_counts = [0; ZOPFLI_NUM_LL];
+            let mut d_counts = [0; ZOPFLI_NUM_D];
             for i in lstart..lend {
                 ll_counts[self.ll_symbol[i] as usize] += 1;
                 if let LitLen::LengthDist(_, _) = self.litlens[i] {
@@ -284,28 +276,18 @@ impl Lz77Store {
         } else {
             /* Subtract the cumulative histograms at the end and the start to get the
             histogram for this range. */
-            let (ll, d) = self.get_histogram_at(lend - 1);
+            let (mut ll, mut d) = self.get_histogram_at(lend - 1);
 
             if lstart > 0 {
                 let (ll2, d2) = self.get_histogram_at(lstart - 1);
-
-                (
-                    ll.iter()
-                        .zip(ll2.iter())
-                        .map(|(&ll_item1, &ll_item2)| ll_item1 - ll_item2)
-                        .collect::<Vec<_>>()
-                        .try_into()
-                        .unwrap(),
-                    d.iter()
-                        .zip(d2.iter())
-                        .map(|(&d_item1, &d_item2)| d_item1 - d_item2)
-                        .collect::<Vec<_>>()
-                        .try_into()
-                        .unwrap(),
-                )
-            } else {
-                (ll, d)
+                for (item, &item2) in ll.iter_mut().zip(&ll2) {
+                    *item -= item2;
+                }
+                for (item, &item2) in d.iter_mut().zip(&d2) {
+                    *item -= item2;
+                }
             }
+            (ll, d)
         }
     }
 

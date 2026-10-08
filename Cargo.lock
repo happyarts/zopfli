@@ -491,7 +491,6 @@ dependencies = [
 name = "zopfli"
 version = "0.8.4"
 dependencies = [
- "bumpalo",
  "crc32fast",
  "log",
  "miniz_oxide",

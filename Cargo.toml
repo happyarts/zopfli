@@ -28,7 +28,6 @@ name = "zopfli"
 required-features = ["gzip", "std", "zlib"]
 
 [dependencies]
-bumpalo = "3.20.3"
 crc32fast = { version = "1.5.2", default-features = false, optional = true }
 log = { version = "0.4.34", optional = true }
 simd-adler32 = { version = "0.3.10", default-features = false, optional = true }
