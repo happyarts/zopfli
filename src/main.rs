@@ -1,7 +1,7 @@
 use std::{
     env,
     fs::File,
-    io::{self, prelude::*},
+    io::{self, prelude::*, BufWriter},
 };
 
 #[cfg(feature = "std")]
@@ -30,9 +30,11 @@ fn main() {
         // Attempt to create the output file, panic if the output file could not be opened
         let out_file = File::create(&out_filename)
             .unwrap_or_else(|why| panic!("couldn't create output file {out_filename}: {why}"));
-        let mut out_file = WriteStatistics::new(out_file);
+        // The encoder hands its output over a byte at a time.
+        let mut out_file = WriteStatistics::new(BufWriter::new(out_file));
 
         zopfli::compress(options, output_type, &file, &mut out_file)
+            .and_then(|()| out_file.flush())
             .unwrap_or_else(|why| panic!("couldn't write to output file {out_filename}: {why}"));
 
         let out_size = out_file.count;
