@@ -1,4 +1,4 @@
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use core::cmp;
 
 use crate::{
@@ -6,8 +6,8 @@ use crate::{
     hash::{Which, ZopfliHash},
     symbols::{get_dist_symbol, get_length_symbol},
     util::{
-        boxed_array, ZOPFLI_MAX_CHAIN_HITS, ZOPFLI_MAX_MATCH, ZOPFLI_MIN_MATCH, ZOPFLI_NUM_D,
-        ZOPFLI_NUM_LL, ZOPFLI_WINDOW_MASK, ZOPFLI_WINDOW_SIZE,
+        ZOPFLI_MAX_CHAIN_HITS, ZOPFLI_MAX_MATCH, ZOPFLI_MIN_MATCH, ZOPFLI_NUM_D, ZOPFLI_NUM_LL,
+        ZOPFLI_WINDOW_MASK, ZOPFLI_WINDOW_SIZE,
     },
 };
 
@@ -31,7 +31,7 @@ impl LitLen {
 /// Parameter dists: Contains the distances. A value is 0 to indicate that there is
 /// no dist and the corresponding litlens value is a literal instead of a length.
 /// Parameter size: The size of both the litlens and dists arrays.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct Lz77Store {
     pub litlens: Vec<LitLen>,
 
@@ -42,6 +42,29 @@ pub struct Lz77Store {
 
     ll_counts: Vec<usize>,
     d_counts: Vec<usize>,
+}
+
+impl Clone for Lz77Store {
+    fn clone(&self) -> Self {
+        Self {
+            litlens: self.litlens.clone(),
+            pos: self.pos.clone(),
+            ll_symbol: self.ll_symbol.clone(),
+            d_symbol: self.d_symbol.clone(),
+            ll_counts: self.ll_counts.clone(),
+            d_counts: self.d_counts.clone(),
+        }
+    }
+
+    /// Keeps the vectors of `self` where they have room.
+    fn clone_from(&mut self, source: &Self) {
+        self.litlens.clone_from(&source.litlens);
+        self.pos.clone_from(&source.pos);
+        self.ll_symbol.clone_from(&source.ll_symbol);
+        self.d_symbol.clone_from(&source.d_symbol);
+        self.ll_counts.clone_from(&source.ll_counts);
+        self.d_counts.clone_from(&source.d_counts);
+    }
 }
 
 impl Lz77Store {
@@ -77,7 +100,7 @@ impl Lz77Store {
         let llstart = ZOPFLI_NUM_LL * (origsize / ZOPFLI_NUM_LL);
         let dstart = ZOPFLI_NUM_D * (origsize / ZOPFLI_NUM_D);
 
-        if origsize % ZOPFLI_NUM_LL == 0 {
+        if origsize.is_multiple_of(ZOPFLI_NUM_LL) {
             if origsize == 0 {
                 self.ll_counts.resize(origsize + ZOPFLI_NUM_LL, 0);
             } else {
@@ -87,7 +110,7 @@ impl Lz77Store {
             }
         }
 
-        if origsize % ZOPFLI_NUM_D == 0 {
+        if origsize.is_multiple_of(ZOPFLI_NUM_D) {
             if origsize == 0 {
                 self.d_counts.resize(ZOPFLI_NUM_D, 0);
             } else {
@@ -116,6 +139,14 @@ impl Lz77Store {
                 self.ll_counts[llstart + len_sym] += 1;
                 self.d_counts[dstart + get_dist_symbol(dist) as usize] += 1;
             }
+        }
+    }
+
+    /// Moves every position `by` bytes towards the start, for when that many
+    /// bytes are dropped from the front of the input buffer.
+    pub fn shift_positions(&mut self, by: usize) {
+        for pos in &mut self.pos {
+            *pos -= by;
         }
     }
 
@@ -288,29 +319,21 @@ impl Lz77Store {
         }
     }
 
-    fn get_histogram_at(
-        &self,
-        lpos: usize,
-    ) -> (Box<[usize; ZOPFLI_NUM_LL]>, Box<[usize; ZOPFLI_NUM_D]>) {
-        let mut ll = boxed_array(0);
-        let mut d = boxed_array(0);
-
+    fn get_histogram_at(&self, lpos: usize) -> ([usize; ZOPFLI_NUM_LL], [usize; ZOPFLI_NUM_D]) {
         /* The real histogram is created by using the histogram for this chunk, but
         all superfluous values of this chunk subtracted. */
         let llpos = ZOPFLI_NUM_LL * (lpos / ZOPFLI_NUM_LL);
         let dpos = ZOPFLI_NUM_D * (lpos / ZOPFLI_NUM_D);
 
-        for (i, item) in ll.iter_mut().enumerate() {
-            *item = self.ll_counts[llpos + i];
-        }
+        let mut ll = [0; ZOPFLI_NUM_LL];
+        ll.copy_from_slice(&self.ll_counts[llpos..llpos + ZOPFLI_NUM_LL]);
         let end = cmp::min(llpos + ZOPFLI_NUM_LL, self.size());
         for i in (lpos + 1)..end {
             ll[self.ll_symbol[i] as usize] -= 1;
         }
 
-        for (i, item) in d.iter_mut().enumerate() {
-            *item = self.d_counts[dpos + i];
-        }
+        let mut d = [0; ZOPFLI_NUM_D];
+        d.copy_from_slice(&self.d_counts[dpos..dpos + ZOPFLI_NUM_D]);
         let end = cmp::min(dpos + ZOPFLI_NUM_D, self.size());
         for i in (lpos + 1)..end {
             if let LitLen::LengthDist(_, _) = self.litlens[i] {
@@ -328,10 +351,10 @@ impl Lz77Store {
         &self,
         lstart: usize,
         lend: usize,
-    ) -> (Box<[usize; ZOPFLI_NUM_LL]>, Box<[usize; ZOPFLI_NUM_D]>) {
+    ) -> ([usize; ZOPFLI_NUM_LL], [usize; ZOPFLI_NUM_D]) {
         if lstart + ZOPFLI_NUM_LL * 3 > lend {
-            let mut ll_counts = boxed_array(0);
-            let mut d_counts = boxed_array(0);
+            let mut ll_counts = [0; ZOPFLI_NUM_LL];
+            let mut d_counts = [0; ZOPFLI_NUM_D];
             for i in lstart..lend {
                 ll_counts[self.ll_symbol[i] as usize] += 1;
                 if let LitLen::LengthDist(_, _) = self.litlens[i] {
@@ -342,28 +365,18 @@ impl Lz77Store {
         } else {
             /* Subtract the cumulative histograms at the end and the start to get the
             histogram for this range. */
-            let (ll, d) = self.get_histogram_at(lend - 1);
+            let (mut ll, mut d) = self.get_histogram_at(lend - 1);
 
             if lstart > 0 {
                 let (ll2, d2) = self.get_histogram_at(lstart - 1);
-
-                (
-                    ll.iter()
-                        .zip(ll2.iter())
-                        .map(|(&ll_item1, &ll_item2)| ll_item1 - ll_item2)
-                        .collect::<Vec<_>>()
-                        .try_into()
-                        .unwrap(),
-                    d.iter()
-                        .zip(d2.iter())
-                        .map(|(&d_item1, &d_item2)| d_item1 - d_item2)
-                        .collect::<Vec<_>>()
-                        .try_into()
-                        .unwrap(),
-                )
-            } else {
-                (ll, d)
+                for (item, &item2) in ll.iter_mut().zip(&ll2) {
+                    *item -= item2;
+                }
+                for (item, &item2) in d.iter_mut().zip(&d2) {
+                    *item -= item2;
+                }
             }
+            (ll, d)
         }
     }
 
@@ -499,7 +512,7 @@ pub fn find_longest_match<C: Cache>(
     longest_match
 }
 
-fn find_longest_match_loop(
+pub(crate) fn find_longest_match_loop(
     h: &ZopfliHash,
     array: &[u8],
     pos: usize,
@@ -617,7 +630,7 @@ fn find_longest_match_loop(
 ///  rather unpredictable way
 /// -the first zopfli run, so it affects the chance of the first run being closer
 ///  to the optimal output
-const fn get_length_score(length: i32, distance: i32) -> i32 {
+pub(crate) const fn get_length_score(length: i32, distance: i32) -> i32 {
     // At 1024, the distance uses 9+ extra bits and this seems to be the sweet spot
     // on tested files.
     if distance > 1024 {
@@ -628,7 +641,7 @@ const fn get_length_score(length: i32, distance: i32) -> i32 {
 }
 
 #[cfg(debug_assertions)]
-fn verify_len_dist(data: &[u8], pos: usize, dist: u16, length: u16) {
+pub(crate) fn verify_len_dist(data: &[u8], pos: usize, dist: u16, length: u16) {
     for i in 0..length {
         let d1 = data[pos - (dist as usize) + (i as usize)];
         let d2 = data[pos + (i as usize)];
@@ -640,4 +653,4 @@ fn verify_len_dist(data: &[u8], pos: usize, dist: u16, length: u16) {
 }
 
 #[cfg(not(debug_assertions))]
-fn verify_len_dist(_data: &[u8], _pos: usize, _dist: u16, _length: u16) {}
+pub(crate) fn verify_len_dist(_data: &[u8], _pos: usize, _dist: u16, _length: u16) {}

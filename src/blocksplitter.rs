@@ -227,9 +227,19 @@ pub fn blocksplit(
     {
         store.greedy(&mut NoCache, in_data, instart, inend);
     }
+    blocksplit_store(&store, instart, maxblocks, splitpoints);
+}
 
+/// Does the same as `blocksplit` with the greedy LZ77 data of `instart..` given.
+pub fn blocksplit_store(
+    store: &Lz77Store,
+    instart: usize,
+    maxblocks: u16,
+    splitpoints: &mut Vec<usize>,
+) {
+    splitpoints.clear();
     let mut lz77splitpoints = Vec::with_capacity(maxblocks as usize);
-    blocksplit_lz77(&store, maxblocks, &mut lz77splitpoints);
+    blocksplit_lz77(store, maxblocks, &mut lz77splitpoints);
 
     let nlz77points = lz77splitpoints.len();
 

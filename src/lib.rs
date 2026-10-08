@@ -55,6 +55,7 @@ use proptest::prelude::*;
 #[cfg(feature = "zlib")]
 pub use zlib::ZlibEncoder;
 
+mod bintree;
 mod blocksplitter;
 mod cache;
 mod deflate;
@@ -66,6 +67,7 @@ mod io;
 mod iter;
 mod katajainen;
 mod lz77;
+mod matches;
 #[cfg(not(feature = "std"))]
 mod math;
 mod squeeze;
@@ -109,6 +111,53 @@ pub struct Options {
     ///
     /// Default value: 15.
     pub maximum_block_splits: u16,
+    /// Finds the matches of each block once and keeps them, so that the
+    /// iterations need no match search. Same output. Replaces the longest match
+    /// cache in this path: 4 bytes per position and 4 per run of equal
+    /// distance, instead of its 28 bytes per position.
+    ///
+    /// Default value: true.
+    pub match_cache: bool,
+    /// When writing a dynamic block, also tries other Huffman code lengths
+    /// (another smoothing of the counts, lower length limits) and replacing short
+    /// matches that cost more than their literals; keeps what is smallest.
+    ///
+    /// Default value: false.
+    pub final_block_trials: bool,
+    /// After the iterations, repeats the optimal parse with the real Huffman code
+    /// lengths of the best result as long as that makes the block smaller.
+    /// Needs `match_cache`.
+    ///
+    /// Default value: false.
+    pub code_length_passes: bool,
+    /// Finds matches with a binary tree instead of hash chains, once for each
+    /// chunk of input (block splitting and all blocks). It can find other
+    /// distances than the hash chains, so the output can differ. Needs
+    /// `match_cache`.
+    ///
+    /// Default value: false.
+    pub tree_match_finder: bool,
+    /// Compresses the chunks the input arrives in (1 MB with `compress`) on
+    /// several threads at once; same output. A chunk goes to a worker thread
+    /// with the window before it once the next one arrives; threads start as
+    /// chunks come, up to the available parallelism, and at most twice as many
+    /// chunks as threads are held before a write waits. An error of the sink
+    /// can surface on a later call; a write that returns an error has taken
+    /// none of its data. Only with the `std` feature and dynamic blocks.
+    ///
+    /// Default value: false.
+    pub parallel_chunks: bool,
+    /// Joins neighbouring blocks, also across the chunks the input arrives in,
+    /// wherever one block is smaller than the two (at most 16 blocks into one;
+    /// blocks stored uncompressed are not joined). Never makes the output
+    /// larger. Blocks that are not joined are written as without this option,
+    /// except that empty chunks give no empty blocks. The last block is held
+    /// back, with its input and the 32 KiB before it, until the next one is
+    /// known: with the 1 MiB chunks of `compress`, up to about 16 MiB of input.
+    /// Dynamic blocks only.
+    ///
+    /// Default value: false.
+    pub merge_blocks: bool,
 }
 
 impl Default for Options {
@@ -117,6 +166,12 @@ impl Default for Options {
             iteration_count: NonZeroU64::new(15).unwrap(),
             iterations_without_improvement: NonZeroU64::new(u64::MAX).unwrap(),
             maximum_block_splits: 15,
+            match_cache: true,
+            final_block_trials: false,
+            code_length_passes: false,
+            tree_match_finder: false,
+            parallel_chunks: false,
+            merge_blocks: false,
         }
     }
 }
@@ -213,5 +268,238 @@ mod test {
             let decompressed_data = inflate::decompress_to_vec(&compressed_data).expect("Could not inflate compressed stream");
             prop_assert_eq!(data, decompressed_data, "Decompressed data should match input data");
         }
+
+        #[test]
+        fn match_cache_does_not_change_the_output(
+            iterations in 1..6u64,
+            cuts in cuts(),
+            runs in runs(4, 1500, 200)
+        ) {
+            let data = from_runs(&runs);
+            let options = |match_cache| Options {
+                iteration_count: NonZeroU64::new(iterations).unwrap(),
+                match_cache,
+                ..Options::default()
+            };
+            prop_assert_eq!(
+                compress_in_pieces(options(true), &data, &cuts),
+                compress_in_pieces(options(false), &data, &cuts)
+            );
+        }
+
+        #[test]
+        fn parallel_chunks_do_not_change_the_output(
+            others: bool,
+            merge_blocks: bool,
+            cuts in cuts(),
+            runs in runs(6, 3000, 400)
+        ) {
+            let data = from_runs(&runs);
+            let options = |parallel_chunks| Options {
+                iteration_count: NonZeroU64::new(2).unwrap(),
+                final_block_trials: others,
+                code_length_passes: others,
+                tree_match_finder: others,
+                parallel_chunks,
+                merge_blocks,
+                ..Options::default()
+            };
+            let parallel = compress_in_pieces(options(true), &data, &cuts);
+            prop_assert_eq!(&parallel, &compress_in_pieces(options(false), &data, &cuts));
+            let decompressed = inflate::decompress_to_vec(&parallel).expect("Could not inflate compressed stream");
+            prop_assert_eq!(data, decompressed);
+        }
+
+        #[test]
+        fn merging_blocks_never_makes_the_output_larger(
+            others: bool,
+            cuts in cuts(),
+            runs in runs(6, 3000, 400)
+        ) {
+            let data = from_runs(&runs);
+            let options = |merge_blocks| Options {
+                iteration_count: NonZeroU64::new(2).unwrap(),
+                final_block_trials: others,
+                code_length_passes: others,
+                tree_match_finder: others,
+                merge_blocks,
+                ..Options::default()
+            };
+            let merged = compress_in_pieces(options(true), &data, &cuts);
+            prop_assert!(merged.len() <= compress_in_pieces(options(false), &data, &cuts).len());
+            let decompressed = inflate::decompress_to_vec(&merged).expect("Could not inflate compressed stream");
+            prop_assert_eq!(data, decompressed);
+        }
+
+        #[test]
+        fn all_options_are_reversible(
+            iterations in 1..5u64,
+            cuts in cuts(),
+            runs in runs(6, 1500, 300)
+        ) {
+            let data = from_runs(&runs);
+            let options = Options {
+                iteration_count: NonZeroU64::new(iterations).unwrap(),
+                final_block_trials: true,
+                code_length_passes: true,
+                tree_match_finder: true,
+                merge_blocks: true,
+                ..Options::default()
+            };
+            let compressed = compress_in_pieces(options, &data, &cuts);
+            let decompressed = inflate::decompress_to_vec(&compressed).expect("Could not inflate compressed stream");
+            prop_assert_eq!(data, decompressed);
+        }
+    }
+
+    /// A sink that fails once `room` bytes are written.
+    struct Failing {
+        room: usize,
+    }
+
+    impl io::Write for Failing {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.len() > self.room {
+                return Err(io::Error::other("full"));
+            }
+            self.room -= buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn parallel_chunks_report_a_failing_sink() {
+        let data = from_runs(
+            &(0..3000)
+                .map(|i| ((i % 7) as u8, 1 + i % 900))
+                .collect::<Vec<_>>(),
+        );
+        for merge_blocks in [false, true] {
+            let options = Options {
+                iteration_count: NonZeroU64::new(1).unwrap(),
+                parallel_chunks: true,
+                merge_blocks,
+                ..Options::default()
+            };
+            let mut encoder =
+                DeflateEncoder::new(options, BlockType::Dynamic, Failing { room: 100 });
+            // The error surfaces on a later write or at the end.
+            let written = data
+                .chunks(64 * 1024)
+                .try_for_each(|piece| encoder.write_all(piece));
+            assert!(written.is_err() || encoder.finish().is_err());
+        }
+    }
+
+    #[test]
+    fn encoders_are_send_sync_and_unwind_safe() {
+        fn check<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        check::<DeflateEncoder<Vec<u8>>>();
+        #[cfg(feature = "gzip")]
+        check::<GzipEncoder<Vec<u8>>>();
+        #[cfg(feature = "zlib")]
+        check::<ZlibEncoder<Vec<u8>>>();
+    }
+
+    /// Runs `f` on a thread of its own; fails if it panics or takes more than
+    /// a minute.
+    fn within_a_minute(f: impl FnOnce() + Send + 'static) {
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let _ = done.send(result.is_ok());
+        });
+        let finished = wait.recv_timeout(std::time::Duration::from_secs(60));
+        assert_eq!(finished, Ok(true), "failed or still running after a minute");
+    }
+
+    #[test]
+    fn a_panic_in_a_worker_reaches_the_caller_and_nothing_waits_for_it() {
+        within_a_minute(|| {
+            let mut first = deflate::TEST_PANIC.to_vec();
+            first.resize(30_000, 7);
+            let other = vec![3; 30_000];
+            // More chunks than the threads hold: a write waits for the first
+            // chunk and meets the panic.
+            let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+            let pieces =
+                || core::iter::once(&first).chain(core::iter::repeat_n(&other, 2 * threads + 4));
+            let is_test_panic = |payload: Box<dyn core::any::Any + Send>| {
+                payload.downcast_ref::<&str>() == Some(&"test panic in a worker")
+            };
+            for merge_blocks in [false, true] {
+                let options = Options {
+                    iteration_count: NonZeroU64::new(1).unwrap(),
+                    parallel_chunks: true,
+                    merge_blocks,
+                    ..Options::default()
+                };
+                // Caught, then finished: an error.
+                let mut encoder = DeflateEncoder::new(options, BlockType::Dynamic, Vec::new());
+                let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    for piece in pieces() {
+                        encoder.write_all(piece).unwrap();
+                    }
+                }));
+                assert!(is_test_panic(written.unwrap_err()));
+                assert!(encoder.write_all(&other).is_err());
+                assert!(encoder.finish().is_err());
+
+                // Not caught: the encoder is dropped while the panic unwinds.
+                let dropped = std::panic::catch_unwind(|| {
+                    let mut encoder = DeflateEncoder::new(options, BlockType::Dynamic, Vec::new());
+                    for piece in pieces() {
+                        encoder.write_all(piece).unwrap();
+                    }
+                });
+                assert!(is_test_panic(dropped.unwrap_err()));
+            }
+        });
+    }
+
+    /// Data from runs of one of `symbols` byte values, each up to `longest`
+    /// long: many matches, and long repetitions of one byte.
+    fn runs(symbols: u8, longest: usize, count: usize) -> impl Strategy<Value = Vec<(u8, usize)>> {
+        prop::collection::vec((0..symbols, 1..longest), 0..count)
+    }
+
+    fn from_runs(runs: &[(u8, usize)]) -> Vec<u8> {
+        runs.iter()
+            .flat_map(|&(b, n)| std::iter::repeat_n(b, n))
+            .collect()
+    }
+
+    /// Where to cut the input into separate writes, as fractions of its length
+    /// (in 1/1024); equal cuts give empty writes.
+    fn cuts() -> impl Strategy<Value = Vec<usize>> {
+        prop::collection::vec(0..=1024usize, 0..6)
+    }
+
+    /// Compresses `data` with one `write` call per piece between the `cuts`,
+    /// including empty ones, so that the encoder sees several chunks.
+    fn compress_in_pieces(options: Options, data: &[u8], cuts: &[usize]) -> Vec<u8> {
+        let mut cuts: Vec<usize> = cuts.iter().map(|&c| c * data.len() / 1024).collect();
+        cuts.sort_unstable();
+        let mut out = Vec::new();
+        let mut encoder = DeflateEncoder::new(options, BlockType::Dynamic, &mut out);
+        let mut last = 0;
+        for &cut in cuts.iter().chain(core::iter::once(&data.len())) {
+            let mut piece = &data[last..cut];
+            // `write_all` skips empty pieces; `write` hands them over.
+            if piece.is_empty() {
+                assert_eq!(encoder.write(piece).unwrap(), 0);
+            }
+            while !piece.is_empty() {
+                let n = encoder.write(piece).unwrap();
+                piece = &piece[n..];
+            }
+            last = cut;
+        }
+        encoder.finish().unwrap();
+        out
     }
 }

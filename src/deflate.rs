@@ -1,16 +1,21 @@
 use alloc::vec::Vec;
 use core::{cmp, iter};
+#[cfg(feature = "std")]
+use std::sync::{Mutex, PoisonError};
 
 #[cfg(feature = "std")]
 use log::{debug, log_enabled};
 
 use crate::{
-    blocksplitter::{blocksplit, blocksplit_lz77},
-    cache::ZopfliLongestMatchCache,
+    blocksplitter::{blocksplit, blocksplit_lz77, blocksplit_store},
+    cache::{NoCache, ZopfliLongestMatchCache},
     iter::ToFlagLastIterator,
     katajainen::length_limited_code_lengths,
     lz77::{LitLen, Lz77Store},
-    squeeze::{lz77_optimal, lz77_optimal_fixed},
+    squeeze::{
+        fill_match_cache_tree, greedy_cached, lz77_optimal, lz77_optimal_fixed, uses_match_cache,
+        ChunkMatches,
+    },
     symbols::{
         get_dist_extra_bits, get_dist_extra_bits_value, get_dist_symbol,
         get_dist_symbol_extra_bits, get_length_extra_bits, get_length_extra_bits_value,
@@ -25,7 +30,9 @@ use crate::{
 /// to it to the specified sink. Most users will find using [`compress`](crate::compress)
 /// easier and more performant.
 ///
-/// The data will be compressed as soon as possible, without trying to fill a
+/// Unless `Options::parallel_chunks` or `Options::merge_blocks` is set, which
+/// hold data back until later writes or [`finish`](DeflateEncoder::finish),
+/// the data will be compressed as soon as possible, without trying to fill a
 /// backreference window. As a consequence, frequent short writes may cause more
 /// DEFLATE blocks to be emitted with less optimal Huffman trees, which can hurt
 /// compression and runtime. If they are a concern, short writes can be conveniently
@@ -40,6 +47,13 @@ pub struct DeflateEncoder<W: Write> {
     chunk_start: usize,
     window_and_chunk: Vec<u8>,
     bitwise_writer: Option<BitwiseWriter<W>>,
+    /// With `Options::parallel_chunks`: the chunks before the last one, worked
+    /// out on other threads. Only used through `&mut self` (`get_mut`); the
+    /// mutex keeps the encoder `Sync` and unwind safe.
+    #[cfg(feature = "std")]
+    pool: Option<Mutex<chunk_pool::ChunkPool>>,
+    /// With `Options::merge_blocks`.
+    merger: BlockMerger,
 }
 
 impl<W: Write> DeflateEncoder<W> {
@@ -53,6 +67,9 @@ impl<W: Write> DeflateEncoder<W> {
             chunk_start: 0,
             window_and_chunk: Vec::with_capacity(ZOPFLI_WINDOW_SIZE),
             bitwise_writer: Some(BitwiseWriter::new(sink)),
+            #[cfg(feature = "std")]
+            pool: None,
+            merger: BlockMerger::default(),
         }
     }
 
@@ -85,6 +102,32 @@ impl<W: Write> DeflateEncoder<W> {
     /// available.
     #[inline]
     fn compress_chunk(&mut self, is_last: bool) -> Result<(), Error> {
+        if self.options.merge_blocks && self.btype == BlockType::Dynamic {
+            let (lz77, splitpoints) = blocksplit_plan(
+                &self.options,
+                &self.window_and_chunk,
+                self.chunk_start,
+                self.window_and_chunk.len(),
+            );
+            let writer = self.bitwise_writer.as_mut().unwrap();
+            let mut last = 0;
+            for &item in splitpoints.iter().chain(iter::once(&lz77.size())) {
+                self.merger.push(
+                    self.options.final_block_trials,
+                    &self.window_and_chunk,
+                    &lz77,
+                    0,
+                    last,
+                    item,
+                    writer,
+                )?;
+                last = item;
+            }
+            if is_last {
+                self.merger.finish(&self.window_and_chunk, writer)?;
+            }
+            return Ok(());
+        }
         deflate_part(
             &self.options,
             self.btype,
@@ -103,13 +146,17 @@ impl<W: Write> DeflateEncoder<W> {
         // Remove bytes exceeding the window size. Start with the
         // oldest bytes, which are at the beginning of the buffer.
         // The buffer length is then the position where the chunk
-        // we've just received starts
-        self.window_and_chunk.drain(
-            ..self
-                .window_and_chunk
-                .len()
-                .saturating_sub(ZOPFLI_WINDOW_SIZE),
-        );
+        // we've just received starts. A block held back for merging keeps
+        // its bytes and the window before them in the buffer.
+        let mut dropped = self
+            .window_and_chunk
+            .len()
+            .saturating_sub(ZOPFLI_WINDOW_SIZE);
+        if let Some(start) = self.merger.start() {
+            dropped = cmp::min(dropped, start.saturating_sub(ZOPFLI_WINDOW_SIZE));
+        }
+        self.window_and_chunk.drain(..dropped);
+        self.merger.shift_positions(dropped);
         self.chunk_start = self.window_and_chunk.len();
 
         self.window_and_chunk.extend_from_slice(chunk);
@@ -127,12 +174,52 @@ impl<W: Write> DeflateEncoder<W> {
             return Ok(None);
         }
 
-        self.compress_chunk(true)?;
+        #[cfg(feature = "std")]
+        let pooled = self.pool.is_some();
+        #[cfg(not(feature = "std"))]
+        let pooled = false;
+        if pooled {
+            #[cfg(feature = "std")]
+            self.finish_pool()?;
+        } else {
+            self.compress_chunk(true)?;
+        }
 
         let mut bitwise_writer = self.bitwise_writer.take().unwrap();
         bitwise_writer.finish_partial_bits()?;
 
         Ok(Some(bitwise_writer.out))
+    }
+
+    /// The thread pool, if chunks went to it.
+    #[cfg(feature = "std")]
+    fn pool_mut(&mut self) -> Option<&mut chunk_pool::ChunkPool> {
+        self.pool
+            .as_mut()
+            .map(|pool| pool.get_mut().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Hands the last chunk to the thread pool too and writes all chunks, the
+    /// last one as the final one.
+    #[cfg(feature = "std")]
+    fn finish_pool(&mut self) -> Result<(), Error> {
+        let Some(pool) = self.pool.as_mut() else {
+            return Ok(());
+        };
+        let pool = pool.get_mut().unwrap_or_else(PoisonError::into_inner);
+        pool.check()?;
+        if !pool.has_last() {
+            // Without a chunk (after a write that failed), the final block is
+            // empty.
+            let start = if self.have_chunk {
+                self.chunk_start
+            } else {
+                self.window_and_chunk.len()
+            };
+            pool.submit_last(core::mem::take(&mut self.window_and_chunk), start);
+            self.have_chunk = false;
+        }
+        pool.write_all(self.bitwise_writer.as_mut().unwrap())
     }
 
     /// Gets a reference to the underlying writer.
@@ -151,6 +238,32 @@ impl<W: Write> DeflateEncoder<W> {
 
 impl<W: Write> Write for DeflateEncoder<W> {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Error> {
+        #[cfg(feature = "std")]
+        if self.options.parallel_chunks && self.btype == BlockType::Dynamic {
+            if self.have_chunk {
+                // The previous chunk is not the last: it goes to a worker, and its
+                // end stays as the window of this one.
+                let data = core::mem::take(&mut self.window_and_chunk);
+                self.window_and_chunk
+                    .extend_from_slice(&data[data.len().saturating_sub(ZOPFLI_WINDOW_SIZE)..]);
+                self.have_chunk = false;
+                let options = self.options;
+                self.pool
+                    .get_or_insert_with(|| Mutex::new(chunk_pool::ChunkPool::new(options)))
+                    .get_mut()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .submit(data, self.chunk_start);
+            }
+            let bitwise_writer = self.bitwise_writer.as_mut().unwrap();
+            if let Some(pool) = self.pool.as_mut() {
+                pool.get_mut()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .write_finished(false, bitwise_writer)?;
+            }
+            self.set_chunk(buf);
+            return Ok(buf.len());
+        }
+
         // Any previous chunk is known to be non-last at this point,
         // so compress it now
         if self.have_chunk {
@@ -165,12 +278,27 @@ impl<W: Write> Write for DeflateEncoder<W> {
     }
 
     fn flush(&mut self) -> Result<(), Error> {
+        #[cfg(feature = "std")]
+        {
+            let bitwise_writer = self.bitwise_writer.as_mut().unwrap();
+            if let Some(pool) = self.pool.as_mut() {
+                pool.get_mut()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .write_finished(true, bitwise_writer)?;
+            }
+        }
         self.bitwise_writer.as_mut().unwrap().out.flush()
     }
 }
 
 impl<W: Write> Drop for DeflateEncoder<W> {
     fn drop(&mut self) {
+        // After the sink failed or a thread panicked, the chunks still queued
+        // for the threads are left out rather than worked out for nothing.
+        #[cfg(feature = "std")]
+        if self.pool_mut().is_some_and(|pool| pool.failed()) {
+            return;
+        }
         self.__finish().ok();
     }
 }
@@ -286,7 +414,7 @@ fn fixed_tree() -> (Vec<u32>, Vec<u32>) {
 /// Changes the population counts in a way that the consequent Huffman tree
 /// compression, especially its rle-part, will be more likely to compress this data
 /// more efficiently. length contains the size of the histogram.
-fn optimize_huffman_for_rle(counts: &mut [usize]) {
+pub(crate) fn optimize_huffman_for_rle(counts: &mut [usize]) {
     let mut length = counts.len();
     // 1) We don't want to touch the trailing zeros. We may break the
     // rules of the format by adding more data in the distance codes.
@@ -470,8 +598,8 @@ fn calculate_block_symbol_size(
     } else {
         let (ll_counts, d_counts) = lz77.get_histogram(lstart, lend);
         calculate_block_symbol_size_given_counts(
-            &*ll_counts,
-            &*d_counts,
+            &ll_counts[..],
+            &d_counts[..],
             ll_lengths,
             d_lengths,
             lz77,
@@ -809,6 +937,30 @@ fn add_dynamic_tree<W: Write>(
     .map(|_| ())
 }
 
+/// Runs `lz77_optimal` on one block; with the match cache, the longest match
+/// cache is not needed.
+fn lz77_optimal_block(
+    options: &Options,
+    in_data: &[u8],
+    instart: usize,
+    inend: usize,
+    chunk: Option<&ChunkMatches>,
+) -> Lz77Store {
+    if uses_match_cache(options, inend - instart) {
+        let view = chunk.map(|c| c.block(instart, inend));
+        lz77_optimal(&mut NoCache, in_data, instart, inend, options, view)
+    } else {
+        lz77_optimal(
+            &mut ZopfliLongestMatchCache::new(inend - instart),
+            in_data,
+            instart,
+            inend,
+            options,
+            None,
+        )
+    }
+}
+
 /// Adds a deflate block with the given LZ77 data to the output.
 /// `options`: global program options
 /// `btype`: the block type, must be `Fixed` or `Dynamic`
@@ -941,8 +1093,12 @@ fn try_optimize_huffman_for_rle(
     ll_lengths: Vec<u32>,
     d_lengths: Vec<u32>,
 ) -> (f64, Vec<u32>, Vec<u32>) {
-    let mut ll_counts2 = Vec::from(ll_counts);
-    let mut d_counts2 = Vec::from(d_counts);
+    let mut ll_counts2 = [0; ZOPFLI_NUM_LL];
+    let ll_counts2 = &mut ll_counts2[..ll_counts.len()];
+    ll_counts2.copy_from_slice(ll_counts);
+    let mut d_counts2 = [0; ZOPFLI_NUM_D];
+    let d_counts2 = &mut d_counts2[..d_counts.len()];
+    d_counts2.copy_from_slice(d_counts);
 
     let treesize = calculate_tree_size(&ll_lengths, &d_lengths);
     let datasize = calculate_block_symbol_size_given_counts(
@@ -955,11 +1111,11 @@ fn try_optimize_huffman_for_rle(
         lend,
     );
 
-    optimize_huffman_for_rle(&mut ll_counts2);
-    optimize_huffman_for_rle(&mut d_counts2);
+    optimize_huffman_for_rle(ll_counts2);
+    optimize_huffman_for_rle(d_counts2);
 
-    let ll_lengths2 = length_limited_code_lengths(&ll_counts2, 15);
-    let mut d_lengths2 = length_limited_code_lengths(&d_counts2, 15);
+    let ll_lengths2 = length_limited_code_lengths(ll_counts2, 15);
+    let mut d_lengths2 = length_limited_code_lengths(d_counts2, 15);
     patch_distance_codes_for_buggy_decoders(&mut d_lengths2[..]);
 
     let treesize2 = calculate_tree_size(&ll_lengths2, &d_lengths2);
@@ -989,8 +1145,8 @@ fn get_dynamic_lengths(lz77: &Lz77Store, lstart: usize, lend: usize) -> (f64, Ve
     let (mut ll_counts, d_counts) = lz77.get_histogram(lstart, lend);
     ll_counts[256] = 1; /* End symbol. */
 
-    let ll_lengths = length_limited_code_lengths(&*ll_counts, 15);
-    let mut d_lengths = length_limited_code_lengths(&*d_counts, 15);
+    let ll_lengths = length_limited_code_lengths(&ll_counts[..], 15);
+    let mut d_lengths = length_limited_code_lengths(&d_counts[..], 15);
 
     patch_distance_codes_for_buggy_decoders(&mut d_lengths[..]);
 
@@ -998,8 +1154,8 @@ fn get_dynamic_lengths(lz77: &Lz77Store, lstart: usize, lend: usize) -> (f64, Ve
         lz77,
         lstart,
         lend,
-        &*ll_counts,
-        &*d_counts,
+        &ll_counts[..],
+        &d_counts[..],
         ll_lengths,
         d_lengths,
     )
@@ -1058,6 +1214,7 @@ fn add_lz77_data<W: Write>(
 
 #[allow(clippy::too_many_arguments)] // Not feasible to refactor in a more readable way
 fn add_lz77_block_auto_type<W: Write>(
+    trials: bool,
     final_block: bool,
     in_data: &[u8],
     lz77: &Lz77Store,
@@ -1066,16 +1223,6 @@ fn add_lz77_block_auto_type<W: Write>(
     expected_data_size: usize,
     bitwise_writer: &mut BitwiseWriter<W>,
 ) -> Result<(), Error> {
-    let uncompressedcost = calculate_block_size(lz77, lstart, lend, BlockType::Uncompressed);
-    let mut fixedcost = calculate_block_size(lz77, lstart, lend, BlockType::Fixed);
-    let dyncost = calculate_block_size(lz77, lstart, lend, BlockType::Dynamic);
-
-    /* Whether to perform the expensive calculation of creating an optimal block
-    with fixed huffman tree to check if smaller. Only do this for small blocks or
-    blocks which already are pretty good with fixed huffman tree. */
-    let expensivefixed = (lz77.size() < 1000) || fixedcost <= dyncost * 1.1;
-
-    let mut fixedstore = Lz77Store::new();
     if lstart == lend {
         /* Smallest empty block is represented by fixed block */
         bitwise_writer.add_bits(u32::from(final_block), 1)?;
@@ -1083,23 +1230,249 @@ fn add_lz77_block_auto_type<W: Write>(
         bitwise_writer.add_bits(0, 7)?; /* end symbol has code 0000000 */
         return Ok(());
     }
+    let (_, encoding) = choose_block_encoding(trials, in_data, lz77, lstart, lend, lz77.size());
+    write_block_encoding(
+        final_block,
+        in_data,
+        lz77,
+        lstart,
+        lend,
+        expected_data_size,
+        &encoding,
+        bitwise_writer,
+    )
+}
+
+/// Holds back the last block so that the next one can be joined to it when
+/// `choose_block_encoding` finds one block cheaper than the two.
+#[derive(Default)]
+struct BlockMerger {
+    pending: Option<Pending>,
+}
+
+/// A held-back block: its LZ77 data, estimated bits, chosen encoding, and how
+/// many pushed blocks it joins.
+struct Pending {
+    store: Lz77Store,
+    bits: f64,
+    encoding: BlockEncoding,
+    joined: usize,
+}
+
+/// At most this many pushed blocks are joined into one, which bounds the work
+/// and memory of each `push` by that many blocks.
+const MAX_JOINED_BLOCKS: usize = 16;
+
+impl BlockMerger {
+    /// Takes the block `lstart..lend` of `lz77` (nothing if it is empty),
+    /// whose positions lie `offset` further in `in_data`; writes the block
+    /// before it if the two stay apart. Blocks written uncompressed are never
+    /// joined: only for them the estimated bits can differ from the written
+    /// ones.
+    #[allow(clippy::too_many_arguments)]
+    fn push<W: Write>(
+        &mut self,
+        trials: bool,
+        in_data: &[u8],
+        lz77: &Lz77Store,
+        offset: usize,
+        lstart: usize,
+        lend: usize,
+        bitwise_writer: &mut BitwiseWriter<W>,
+    ) -> Result<(), Error> {
+        if lstart == lend {
+            return Ok(());
+        }
+        let mut store = Lz77Store::new();
+        for i in lstart..lend {
+            store.append_store_item(lz77.litlens[i], lz77.pos[i] + offset);
+        }
+        // Chosen exactly as `add_lz77_block_auto_type` chooses for the block of
+        // `lz77`, so that blocks that stay apart are written as without merging.
+        let (bits, encoding) =
+            choose_block_encoding(trials, in_data, &store, 0, store.size(), lz77.size());
+        let block = Pending {
+            store,
+            bits,
+            encoding,
+            joined: 1,
+        };
+        let Some(pending) = &self.pending else {
+            self.pending = Some(block);
+            return Ok(());
+        };
+        if pending.joined < MAX_JOINED_BLOCKS
+            && !matches!(pending.encoding, BlockEncoding::Uncompressed)
+            && !matches!(block.encoding, BlockEncoding::Uncompressed)
+        {
+            let mut merged = pending.store.clone();
+            for (&litlen, &pos) in block.store.litlens.iter().zip(&block.store.pos) {
+                merged.append_store_item(litlen, pos);
+            }
+            let (merged_bits, merged_encoding) =
+                choose_block_encoding(trials, in_data, &merged, 0, merged.size(), merged.size());
+            if merged_bits < pending.bits + block.bits
+                && !matches!(merged_encoding, BlockEncoding::Uncompressed)
+            {
+                self.pending = Some(Pending {
+                    store: merged,
+                    bits: merged_bits,
+                    encoding: merged_encoding,
+                    joined: pending.joined + 1,
+                });
+                return Ok(());
+            }
+        }
+        // The held-back block is replaced only once it is written, so that a
+        // failed write leaves it in place.
+        write_block_encoding(
+            false,
+            in_data,
+            &pending.store,
+            0,
+            pending.store.size(),
+            0,
+            &pending.encoding,
+            bitwise_writer,
+        )?;
+        self.pending = Some(block);
+        Ok(())
+    }
+
+    /// Writes the held-back block as the final one (an empty final block if
+    /// there is none).
+    fn finish<W: Write>(
+        &mut self,
+        in_data: &[u8],
+        bitwise_writer: &mut BitwiseWriter<W>,
+    ) -> Result<(), Error> {
+        match &self.pending {
+            Some(pending) => {
+                write_block_encoding(
+                    true,
+                    in_data,
+                    &pending.store,
+                    0,
+                    pending.store.size(),
+                    0,
+                    &pending.encoding,
+                    bitwise_writer,
+                )?;
+                self.pending = None;
+                Ok(())
+            }
+            None => add_lz77_block_auto_type(
+                false,
+                true,
+                in_data,
+                &Lz77Store::new(),
+                0,
+                0,
+                0,
+                bitwise_writer,
+            ),
+        }
+    }
+
+    /// Where the held-back block starts in the input buffer.
+    fn start(&self) -> Option<usize> {
+        self.pending.as_ref().map(|pending| pending.store.pos[0])
+    }
+
+    /// See `Lz77Store::shift_positions`.
+    fn shift_positions(&mut self, by: usize) {
+        if let Some(Pending {
+            store, encoding, ..
+        }) = &mut self.pending
+        {
+            store.shift_positions(by);
+            match encoding {
+                BlockEncoding::Fixed(Some(store)) | BlockEncoding::Dynamic(Some((store, _, _))) => {
+                    store.shift_positions(by);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// How `add_lz77_block_auto_type` writes a block.
+enum BlockEncoding {
+    Uncompressed,
+    /// With the LZ77 data recalculated for the fixed tree, if it was.
+    Fixed(Option<Lz77Store>),
+    /// With the result of `dynamic_block_trials`, if they ran.
+    Dynamic(Option<(Lz77Store, Vec<u32>, Vec<u32>)>),
+}
+
+/// The cheapest way to write the block `lstart..lend` (not empty) and its
+/// estimated size in bits. `store_size` is the size of the LZ77 data the block
+/// was cut from; below 1000 symbols the block is always also tried with the
+/// fixed tree.
+fn choose_block_encoding(
+    trials: bool,
+    in_data: &[u8],
+    lz77: &Lz77Store,
+    lstart: usize,
+    lend: usize,
+    store_size: usize,
+) -> (f64, BlockEncoding) {
+    let uncompressedcost = calculate_block_size(lz77, lstart, lend, BlockType::Uncompressed);
+    let mut fixedcost = calculate_block_size(lz77, lstart, lend, BlockType::Fixed);
+    let mut dyncost = calculate_block_size(lz77, lstart, lend, BlockType::Dynamic);
+
+    /* Whether to perform the expensive calculation of creating an optimal block
+    with fixed huffman tree to check if smaller. Only do this for small blocks or
+    blocks which already are pretty good with fixed huffman tree. */
+    let expensivefixed = (store_size < 1000) || fixedcost <= dyncost * 1.1;
+
+    // Decided before the trials, so that they only ever add a smaller choice.
+    let tried = trials.then(|| dynamic_block_trials(in_data, lz77, lstart, lend));
+    if let Some((bits, _, _, _)) = &tried {
+        dyncost = dyncost.min(*bits as f64 + 3.0);
+    }
+
+    let mut fixedstore = None;
     if expensivefixed {
         /* Recalculate the LZ77 with lz77_optimal_fixed */
         let instart = lz77.pos[lstart];
         let inend = instart + lz77.get_byte_range(lstart, lend);
-
+        let mut store = Lz77Store::new();
         lz77_optimal_fixed(
             &mut ZopfliLongestMatchCache::new(inend - instart),
             in_data,
             instart,
             inend,
-            &mut fixedstore,
+            &mut store,
         );
-        fixedcost = calculate_block_size(&fixedstore, 0, fixedstore.size(), BlockType::Fixed);
+        fixedcost = calculate_block_size(&store, 0, store.size(), BlockType::Fixed);
+        fixedstore = Some(store);
     }
 
     if uncompressedcost <= fixedcost && uncompressedcost <= dyncost {
-        add_lz77_block(
+        (uncompressedcost, BlockEncoding::Uncompressed)
+    } else if fixedcost <= dyncost {
+        (fixedcost, BlockEncoding::Fixed(fixedstore))
+    } else {
+        let tried = tried.map(|(_, store, ll, d)| (store, ll, d));
+        (dyncost, BlockEncoding::Dynamic(tried))
+    }
+}
+
+/// Writes the block `lstart..lend` the way `choose_block_encoding` chose.
+#[allow(clippy::too_many_arguments)]
+fn write_block_encoding<W: Write>(
+    final_block: bool,
+    in_data: &[u8],
+    lz77: &Lz77Store,
+    lstart: usize,
+    lend: usize,
+    expected_data_size: usize,
+    encoding: &BlockEncoding,
+    bitwise_writer: &mut BitwiseWriter<W>,
+) -> Result<(), Error> {
+    match encoding {
+        BlockEncoding::Uncompressed => add_lz77_block(
             BlockType::Uncompressed,
             final_block,
             in_data,
@@ -1108,33 +1481,37 @@ fn add_lz77_block_auto_type<W: Write>(
             lend,
             expected_data_size,
             bitwise_writer,
-        )
-    } else if fixedcost <= dyncost {
-        if expensivefixed {
-            add_lz77_block(
-                BlockType::Fixed,
+        ),
+        BlockEncoding::Fixed(Some(fixedstore)) => add_lz77_block(
+            BlockType::Fixed,
+            final_block,
+            in_data,
+            fixedstore,
+            0,
+            fixedstore.size(),
+            expected_data_size,
+            bitwise_writer,
+        ),
+        BlockEncoding::Fixed(None) => add_lz77_block(
+            BlockType::Fixed,
+            final_block,
+            in_data,
+            lz77,
+            lstart,
+            lend,
+            expected_data_size,
+            bitwise_writer,
+        ),
+        BlockEncoding::Dynamic(Some((store, ll_lengths, d_lengths))) => {
+            add_dynamic_block_with_lengths(
                 final_block,
-                in_data,
-                &fixedstore,
-                0,
-                fixedstore.size(),
-                expected_data_size,
-                bitwise_writer,
-            )
-        } else {
-            add_lz77_block(
-                BlockType::Fixed,
-                final_block,
-                in_data,
-                lz77,
-                lstart,
-                lend,
-                expected_data_size,
+                store,
+                ll_lengths,
+                d_lengths,
                 bitwise_writer,
             )
         }
-    } else {
-        add_lz77_block(
+        BlockEncoding::Dynamic(None) => add_lz77_block(
             BlockType::Dynamic,
             final_block,
             in_data,
@@ -1143,8 +1520,233 @@ fn add_lz77_block_auto_type<W: Write>(
             lend,
             expected_data_size,
             bitwise_writer,
-        )
+        ),
     }
+}
+
+/// Smooths counts for run-length coding of the code lengths: the core of
+/// Brotli's `OptimizeHuffmanCountsForRle` (24.8 fixed point), as the Efficient
+/// Compression Tool uses it; an alternative to `optimize_huffman_for_rle`.
+fn optimize_huffman_for_rle_brotli(counts: &mut [usize]) {
+    let n = counts.len();
+    let mut length = n;
+    loop {
+        if length == 0 {
+            return;
+        }
+        if counts[length - 1] != 0 {
+            break;
+        }
+        length -= 1;
+    }
+    let at = |counts: &[usize], i: usize| counts.get(i).map_or(0, |&c| c as i64);
+
+    let mut good_for_rle = vec![false; length];
+    let mut symbol = counts[0];
+    let mut stride = 0;
+    for i in 0..=length {
+        if i == length || counts[i] != symbol {
+            if (symbol == 0 && stride >= 5) || stride >= 7 {
+                for k in 0..stride {
+                    good_for_rle[i - k - 1] = true;
+                }
+            }
+            stride = 1;
+            symbol = at(counts, i) as usize;
+        } else {
+            stride += 1;
+        }
+    }
+
+    const STREAK_LIMIT: i64 = 1240;
+    let mut stride: i64 = 0;
+    let mut limit = 256 * (at(counts, 0) + at(counts, 1) + at(counts, 2)) / 3 + 420;
+    let mut sum: i64 = 0;
+    for i in 0..=length {
+        if i == length
+            || good_for_rle[i]
+            || (i > 0 && good_for_rle[i - 1])
+            || (256 * at(counts, i) - limit).abs() >= STREAK_LIMIT
+        {
+            if stride >= 4 {
+                let mut count = (sum + stride / 2) / stride;
+                if count < 1 && sum != 0 {
+                    count = 1;
+                }
+                for k in 0..stride as usize {
+                    counts[i - k - 1] = count as usize;
+                }
+            }
+            stride = 0;
+            sum = 0;
+            limit = if i + 2 < length {
+                256 * (at(counts, i) + at(counts, i + 1) + at(counts, i + 2)) / 3 + 420
+            } else {
+                256 * at(counts, i)
+            };
+        }
+        stride += 1;
+        if i != length {
+            sum += at(counts, i);
+            if stride >= 4 {
+                limit = (256 * sum + stride / 2) / stride;
+            }
+            if stride == 4 {
+                limit += 120;
+            }
+        }
+    }
+}
+
+/// The smallest tree + data size in bits over several ways to choose the code
+/// lengths, with those lengths.
+fn smallest_dynamic_lengths(
+    lz77: &Lz77Store,
+    lstart: usize,
+    lend: usize,
+) -> (usize, Vec<u32>, Vec<u32>) {
+    let (mut ll_counts, d_counts) = lz77.get_histogram(lstart, lend);
+    ll_counts[256] = 1; /* End symbol. */
+    let (_, ll_lengths, d_lengths) = get_dynamic_lengths(lz77, lstart, lend);
+    let size = |ll: &[u32], d: &[u32]| {
+        calculate_tree_size(ll, d)
+            + calculate_block_symbol_size_given_counts(
+                &ll_counts[..],
+                &d_counts[..],
+                ll,
+                d,
+                lz77,
+                lstart,
+                lend,
+            )
+    };
+    let mut best = (size(&ll_lengths, &d_lengths), ll_lengths, d_lengths);
+
+    let mut zopfli = (ll_counts.to_vec(), d_counts.to_vec());
+    optimize_huffman_for_rle(&mut zopfli.0);
+    optimize_huffman_for_rle(&mut zopfli.1);
+    let mut brotli = (ll_counts.to_vec(), d_counts.to_vec());
+    optimize_huffman_for_rle_brotli(&mut brotli.0);
+    optimize_huffman_for_rle_brotli(&mut brotli.1);
+    for (ll, d) in [
+        (&ll_counts[..], &d_counts[..]),
+        (&zopfli.0, &zopfli.1),
+        (&brotli.0, &brotli.1),
+    ] {
+        for maxbits in (9..=15).rev() {
+            let ll_lengths = length_limited_code_lengths(ll, maxbits);
+            let mut d_lengths = length_limited_code_lengths(d, maxbits);
+            patch_distance_codes_for_buggy_decoders(&mut d_lengths);
+            let bits = size(&ll_lengths, &d_lengths);
+            if bits < best.0 {
+                best = (bits, ll_lengths, d_lengths);
+            }
+        }
+    }
+    best
+}
+
+/// Replaces each match of length 3 to 7 that costs more bits with these code
+/// lengths than its bytes as literals. `None` if nothing changes.
+fn replace_costly_matches(
+    in_data: &[u8],
+    lz77: &Lz77Store,
+    lstart: usize,
+    lend: usize,
+    ll_lengths: &[u32],
+    d_lengths: &[u32],
+) -> Option<Lz77Store> {
+    let mut out = Lz77Store::new();
+    let mut changed = false;
+    for i in lstart..lend {
+        let item = lz77.litlens[i];
+        let pos = lz77.pos[i];
+        if let LitLen::LengthDist(length, dist) = item {
+            if (3..=7).contains(&length) {
+                let bytes = &in_data[pos..pos + length as usize];
+                if bytes.iter().all(|&b| ll_lengths[b as usize] != 0) {
+                    let literals: u32 = bytes.iter().map(|&b| ll_lengths[b as usize]).sum();
+                    let matched = ll_lengths[get_length_symbol(length as usize)]
+                        + get_length_extra_bits(length as usize)
+                        + get_dist_extra_bits(dist)
+                        + d_lengths[get_dist_symbol(dist) as usize];
+                    if literals < matched {
+                        for (k, &b) in bytes.iter().enumerate() {
+                            out.lit_len_dist(u16::from(b), 0, pos + k);
+                        }
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.append_store_item(item, pos);
+    }
+    changed.then_some(out)
+}
+
+/// Code lengths and LZ77 data for the smallest dynamic block found by
+/// `smallest_dynamic_lengths` and `replace_costly_matches`, with its size in bits
+/// (without the 3 header bits).
+fn dynamic_block_trials(
+    in_data: &[u8],
+    lz77: &Lz77Store,
+    lstart: usize,
+    lend: usize,
+) -> (usize, Lz77Store, Vec<u32>, Vec<u32>) {
+    let mut store = Lz77Store::new();
+    for i in lstart..lend {
+        store.append_store_item(lz77.litlens[i], lz77.pos[i]);
+    }
+    let (bits, ll, d) = smallest_dynamic_lengths(&store, 0, store.size());
+    let mut best = (bits, store, ll, d);
+    let mut current = (best.1.clone(), best.2.clone(), best.3.clone());
+    for _ in 0..64 {
+        let Some(next) = replace_costly_matches(
+            in_data,
+            &current.0,
+            0,
+            current.0.size(),
+            &current.1,
+            &current.2,
+        ) else {
+            break;
+        };
+        let (bits, ll, d) = smallest_dynamic_lengths(&next, 0, next.size());
+        if bits < best.0 {
+            best = (bits, next.clone(), ll.clone(), d.clone());
+        }
+        current = (next, ll, d);
+    }
+    best
+}
+
+/// Writes a dynamic block with the given code lengths.
+fn add_dynamic_block_with_lengths<W: Write>(
+    final_block: bool,
+    lz77: &Lz77Store,
+    ll_lengths: &[u32],
+    d_lengths: &[u32],
+    bitwise_writer: &mut BitwiseWriter<W>,
+) -> Result<(), Error> {
+    bitwise_writer.add_bit(u8::from(final_block))?;
+    bitwise_writer.add_bit(0)?;
+    bitwise_writer.add_bit(1)?;
+    add_dynamic_tree(ll_lengths, d_lengths, bitwise_writer)?;
+    let ll_symbols = lengths_to_symbols(ll_lengths, 15);
+    let d_symbols = lengths_to_symbols(d_lengths, 15);
+    add_lz77_data(
+        lz77,
+        0,
+        lz77.size(),
+        0,
+        &ll_symbols,
+        ll_lengths,
+        &d_symbols,
+        d_lengths,
+        bitwise_writer,
+    )?;
+    bitwise_writer.add_huffman_bits(ll_symbols[256], ll_lengths[256])
 }
 
 /// Calculates block size in bits, automatically using the best btype.
@@ -1162,6 +1764,7 @@ pub fn calculate_block_size_auto_type(lz77: &Lz77Store, lstart: usize, lend: usi
 }
 
 fn add_all_blocks<W: Write>(
+    trials: bool,
     splitpoints: &[usize],
     lz77: &Lz77Store,
     final_block: bool,
@@ -1170,10 +1773,11 @@ fn add_all_blocks<W: Write>(
 ) -> Result<(), Error> {
     let mut last = 0;
     for &item in splitpoints {
-        add_lz77_block_auto_type(false, in_data, lz77, last, item, 0, bitwise_writer)?;
+        add_lz77_block_auto_type(trials, false, in_data, lz77, last, item, 0, bitwise_writer)?;
         last = item;
     }
     add_lz77_block_auto_type(
+        trials,
         final_block,
         in_data,
         lz77,
@@ -1192,32 +1796,61 @@ fn blocksplit_attempt<W: Write>(
     inend: usize,
     bitwise_writer: &mut BitwiseWriter<W>,
 ) -> Result<(), Error> {
+    let (lz77, splitpoints) = blocksplit_plan(options, in_data, instart, inend);
+    add_all_blocks(
+        options.final_block_trials,
+        &splitpoints,
+        &lz77,
+        final_block,
+        in_data,
+        bitwise_writer,
+    )
+}
+
+/// The LZ77 data of `instart..inend` and where `blocksplit_attempt` splits it
+/// into blocks (LZ77 indices).
+fn blocksplit_plan(
+    options: &Options,
+    in_data: &[u8],
+    instart: usize,
+    inend: usize,
+) -> (Lz77Store, Vec<usize>) {
     let mut totalcost = 0.0;
     let mut lz77 = Lz77Store::new();
 
     /* byte coordinates rather than lz77 index */
     let mut splitpoints_uncompressed = Vec::with_capacity(options.maximum_block_splits as usize);
 
-    blocksplit(
-        in_data,
-        instart,
-        inend,
-        options.maximum_block_splits,
-        &mut splitpoints_uncompressed,
-    );
+    // With the tree match finder, the matches of the whole range are found once,
+    // for the block splitting and every block.
+    let chunk = (options.tree_match_finder && uses_match_cache(options, inend - instart))
+        .then(|| fill_match_cache_tree(in_data, instart, inend));
+    match &chunk {
+        Some(c) => {
+            let mut store = Lz77Store::new();
+            greedy_cached(&mut store, c.cache(), in_data, instart, inend);
+            blocksplit_store(
+                &store,
+                instart,
+                options.maximum_block_splits,
+                &mut splitpoints_uncompressed,
+            );
+        }
+        None => blocksplit(
+            in_data,
+            instart,
+            inend,
+            options.maximum_block_splits,
+            &mut splitpoints_uncompressed,
+        ),
+    }
+    let matches = chunk.as_ref();
     let npoints = splitpoints_uncompressed.len();
     let mut splitpoints = Vec::with_capacity(npoints);
 
     let mut last = instart;
     for &item in &splitpoints_uncompressed {
-        let store = lz77_optimal(
-            &mut ZopfliLongestMatchCache::new(item - last),
-            in_data,
-            last,
-            item,
-            options.iteration_count.get(),
-            options.iterations_without_improvement.get(),
-        );
+        let store = lz77_optimal_block(options, in_data, last, item, matches);
         totalcost += calculate_block_size_auto_type(&store, 0, store.size());
 
         // ZopfliAppendLZ77Store(&store, &lz77);
@@ -1231,14 +1864,7 @@ fn blocksplit_attempt<W: Write>(
         last = item;
     }
 
-    let store = lz77_optimal(
-        &mut ZopfliLongestMatchCache::new(inend - last),
-        in_data,
-        last,
-        inend,
-        options.iteration_count.get(),
-        options.iterations_without_improvement.get(),
-    );
+    let store = lz77_optimal_block(options, in_data, last, inend, matches);
     totalcost += calculate_block_size_auto_type(&store, 0, store.size());
 
     // ZopfliAppendLZ77Store(&store, &lz77);
@@ -1266,7 +1892,382 @@ fn blocksplit_attempt<W: Write>(
         }
     }
 
-    add_all_blocks(&splitpoints, &lz77, final_block, in_data, bitwise_writer)
+    if let Some(c) = chunk {
+        c.recycle();
+    }
+    (lz77, splitpoints)
+}
+
+/// A chunk that starts with these bytes makes the thread working on it panic.
+#[cfg(all(test, feature = "std"))]
+pub(crate) const TEST_PANIC: &[u8] = b"zopfli test: panic in the thread of this chunk";
+
+/// Works out the LZ77 data and block splits of an encoder's chunks on worker
+/// threads, for `Options::parallel_chunks`. Each chunk is handed over with the
+/// window before it, so the plans are the ones the encoder would make itself;
+/// the encoder's thread writes them in order.
+#[cfg(feature = "std")]
+mod chunk_pool {
+    use std::{
+        collections::BTreeMap,
+        panic::{self, AssertUnwindSafe},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc, Mutex,
+        },
+        thread,
+    };
+
+    use super::{add_all_blocks, blocksplit_plan, BitwiseWriter, BlockMerger};
+    use crate::{lz77::Lz77Store, util::ZOPFLI_WINDOW_SIZE, Error, Options, Write};
+
+    /// The LZ77 data of a chunk and its block split points.
+    type Plan = (Lz77Store, Vec<usize>);
+
+    /// A chunk: the window before it and the chunk itself, and where the chunk
+    /// starts in that data.
+    struct Job {
+        index: usize,
+        data: Vec<u8>,
+        instart: usize,
+    }
+
+    /// A chunk with its plan, or the panic of the thread that worked on it.
+    struct Done {
+        data: Vec<u8>,
+        instart: usize,
+        plan: thread::Result<Plan>,
+    }
+
+    fn work_out(options: &Options, job: Job) -> (usize, Done) {
+        let plan = panic::catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if job.data[job.instart..].starts_with(super::TEST_PANIC) {
+                panic!("test panic in a worker");
+            }
+            blocksplit_plan(options, &job.data, job.instart, job.data.len())
+        }));
+        (
+            job.index,
+            Done {
+                data: job.data,
+                instart: job.instart,
+                plan,
+            },
+        )
+    }
+
+    /// With `Options::merge_blocks`: the bytes the held-back block needs (it
+    /// and the window before it) followed by the chunk being written, and how
+    /// far that chunk got, so that a write that fails can be tried again.
+    #[derive(Default)]
+    struct Merging {
+        merger: BlockMerger,
+        buffer: Vec<u8>,
+        /// The chunk whose bytes are at the end of `buffer`, how much further
+        /// its positions lie there than in its own data, and how many of its
+        /// blocks the merger has taken.
+        chunk: Option<usize>,
+        offset: usize,
+        blocks: usize,
+    }
+
+    pub struct ChunkPool {
+        options: Options,
+        threads: usize,
+        jobs: mpsc::Sender<Job>,
+        queue: Arc<Mutex<mpsc::Receiver<Job>>>,
+        done_sender: mpsc::Sender<(usize, Done)>,
+        done: mpsc::Receiver<(usize, Done)>,
+        /// Set when the pool is dropped: the workers leave the chunks still
+        /// queued and stop.
+        cancelled: Arc<AtomicBool>,
+        workers: usize,
+        /// Chunks handed over, chunks written, and finished ones not written yet.
+        submitted: usize,
+        written: usize,
+        finished: BTreeMap<usize, Done>,
+        merging: Option<Merging>,
+        /// The chunk handed over by `submit_last`.
+        last: Option<usize>,
+        /// The last attempt to write a chunk failed.
+        failed: bool,
+        /// A worker panicked: nothing more is written.
+        poisoned: bool,
+    }
+
+    impl ChunkPool {
+        pub fn new(options: Options) -> Self {
+            let (jobs, queue) = mpsc::channel();
+            let (done_sender, done) = mpsc::channel();
+            Self {
+                options,
+                threads: thread::available_parallelism().map_or(1, |n| n.get()),
+                jobs,
+                queue: Arc::new(Mutex::new(queue)),
+                done_sender,
+                done,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                workers: 0,
+                submitted: 0,
+                written: 0,
+                finished: BTreeMap::new(),
+                merging: options.merge_blocks.then(Merging::default),
+                last: None,
+                failed: false,
+                poisoned: false,
+            }
+        }
+
+        /// Whether the last attempt to write to the sink failed, or a worker
+        /// panicked.
+        pub fn failed(&self) -> bool {
+            self.failed || self.poisoned
+        }
+
+        /// An error once a worker has panicked.
+        pub fn check(&self) -> Result<(), Error> {
+            if self.poisoned {
+                return Err(Error::other("a zopfli worker thread panicked"));
+            }
+            Ok(())
+        }
+
+        /// Hands a chunk over: `data` holds the window before it and the chunk
+        /// from `instart` on. Starts a worker while there are fewer than threads
+        /// and than chunks not written yet.
+        pub fn submit(&mut self, data: Vec<u8>, instart: usize) {
+            let job = Job {
+                index: self.submitted,
+                data,
+                instart,
+            };
+            self.submitted += 1;
+            if self.workers < self.threads
+                && self.workers < self.submitted - self.written
+                && self.start_worker()
+            {
+                self.workers += 1;
+            }
+            // Without a worker (none could be started), this thread works it out.
+            let job = if self.workers > 0 {
+                match self.jobs.send(job) {
+                    Ok(()) => return,
+                    Err(mpsc::SendError(job)) => job,
+                }
+            } else {
+                job
+            };
+            let (index, done) = work_out(&self.options, job);
+            self.finished.insert(index, done);
+        }
+
+        /// Hands the last chunk over, see `submit`; it is written as the final
+        /// one.
+        pub fn submit_last(&mut self, data: Vec<u8>, instart: usize) {
+            self.last = Some(self.submitted);
+            self.submit(data, instart);
+        }
+
+        pub fn has_last(&self) -> bool {
+            self.last.is_some()
+        }
+
+        fn start_worker(&self) -> bool {
+            let queue = Arc::clone(&self.queue);
+            let done = self.done_sender.clone();
+            let cancelled = Arc::clone(&self.cancelled);
+            let options = self.options;
+            thread::Builder::new()
+                .name("zopfli".into())
+                .spawn(move || loop {
+                    let job = match queue.lock() {
+                        Ok(queue) => queue.recv(),
+                        Err(_) => return,
+                    };
+                    let Ok(job) = job else { return };
+                    if cancelled.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    if done.send(work_out(&options, job)).is_err() {
+                        return;
+                    }
+                })
+                .is_ok()
+        }
+
+        /// Takes the chunks that have finished meanwhile.
+        fn collect(&mut self) {
+            while let Ok((index, done)) = self.done.try_recv() {
+                self.finished.insert(index, done);
+            }
+        }
+
+        /// Waits until the chunk `index` is among the finished ones.
+        fn wait_for(&mut self, index: usize) {
+            while !self.finished.contains_key(&index) {
+                // The pool holds a sender of `done` itself, so this only waits:
+                // every chunk handed over is queued, with a worker or finished.
+                if let Ok((i, done)) = self.done.recv() {
+                    self.finished.insert(i, done);
+                }
+            }
+        }
+
+        /// Writes chunks that have finished, in order: while more than twice
+        /// as many chunks as threads are not written, waiting for the oldest
+        /// one; then one more if it has finished, or with `all` every one that
+        /// has. Writing only a few lets the caller hand over the next chunk
+        /// soon, so that the threads do not run out of work while blocks are
+        /// being joined.
+        pub fn write_finished<W: Write>(
+            &mut self,
+            all: bool,
+            bitwise_writer: &mut BitwiseWriter<W>,
+        ) -> Result<(), Error> {
+            self.check()?;
+            let mut more = true;
+            loop {
+                self.collect();
+                if self.written == self.submitted {
+                    return Ok(());
+                }
+                let over = self.submitted - self.written > self.threads.saturating_mul(2);
+                if !over && !(more || all) {
+                    return Ok(());
+                }
+                if !self.finished.contains_key(&self.written) {
+                    if !over {
+                        return Ok(());
+                    }
+                    self.wait_for(self.written);
+                }
+                if !over {
+                    more = false;
+                }
+                self.write_next(bitwise_writer)?;
+            }
+        }
+
+        /// Writes every chunk handed over, waiting for those not finished.
+        pub fn write_all<W: Write>(
+            &mut self,
+            bitwise_writer: &mut BitwiseWriter<W>,
+        ) -> Result<(), Error> {
+            self.check()?;
+            while self.written < self.submitted {
+                self.wait_for(self.written);
+                self.write_next(bitwise_writer)?;
+            }
+            Ok(())
+        }
+
+        /// Writes the chunk `written`, which has finished. It stays until it is
+        /// written, so that a write that fails leaves it in place.
+        fn write_next<W: Write>(
+            &mut self,
+            bitwise_writer: &mut BitwiseWriter<W>,
+        ) -> Result<(), Error> {
+            if self.finished[&self.written].plan.is_err() {
+                // The panic of the worker goes on here, as it would have without
+                // threads (also when this runs from `Drop`). Its chunk is gone, so
+                // nothing after it can be written any more.
+                self.poisoned = true;
+                if let Some(Done {
+                    plan: Err(payload), ..
+                }) = self.finished.remove(&self.written)
+                {
+                    panic::resume_unwind(payload);
+                }
+            }
+            let next = &self.finished[&self.written];
+            if let Ok(plan) = &next.plan {
+                let written = write_plan(
+                    &self.options,
+                    self.merging.as_mut(),
+                    self.written,
+                    &next.data,
+                    next.instart,
+                    plan,
+                    self.last == Some(self.written),
+                    bitwise_writer,
+                );
+                self.failed = written.is_err();
+                written?;
+            }
+            self.finished.remove(&self.written);
+            self.written += 1;
+            Ok(())
+        }
+    }
+
+    /// Writes the blocks of chunk `index`, through the merger if blocks are
+    /// joined.
+    #[allow(clippy::too_many_arguments)]
+    fn write_plan<W: Write>(
+        options: &Options,
+        merging: Option<&mut Merging>,
+        index: usize,
+        data: &[u8],
+        instart: usize,
+        (lz77, splitpoints): &Plan,
+        last: bool,
+        bitwise_writer: &mut BitwiseWriter<W>,
+    ) -> Result<(), Error> {
+        let Some(merging) = merging else {
+            return add_all_blocks(
+                options.final_block_trials,
+                splitpoints,
+                lz77,
+                last,
+                data,
+                bitwise_writer,
+            );
+        };
+        if merging.chunk != Some(index) {
+            // The chunk joins the buffer, which keeps the held-back block and
+            // the window before it, as the encoder without threads does.
+            let mut dropped = merging.buffer.len().saturating_sub(ZOPFLI_WINDOW_SIZE);
+            if let Some(start) = merging.merger.start() {
+                dropped = dropped.min(start.saturating_sub(ZOPFLI_WINDOW_SIZE));
+            }
+            merging.buffer.drain(..dropped);
+            merging.merger.shift_positions(dropped);
+            merging.offset = merging.buffer.len() - instart;
+            merging.buffer.extend_from_slice(&data[instart..]);
+            merging.chunk = Some(index);
+            merging.blocks = 0;
+        }
+        let ends: Vec<usize> = splitpoints
+            .iter()
+            .copied()
+            .chain(core::iter::once(lz77.size()))
+            .collect();
+        while merging.blocks < ends.len() {
+            let block = merging.blocks;
+            let start = if block == 0 { 0 } else { ends[block - 1] };
+            merging.merger.push(
+                options.final_block_trials,
+                &merging.buffer,
+                lz77,
+                merging.offset,
+                start,
+                ends[block],
+                bitwise_writer,
+            )?;
+            merging.blocks += 1;
+        }
+        if last {
+            merging.merger.finish(&merging.buffer, bitwise_writer)?;
+        }
+        Ok(())
+    }
+
+    impl Drop for ChunkPool {
+        fn drop(&mut self) {
+            self.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Since an uncompressed block can be max 65535 in size, it actually adds

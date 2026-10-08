@@ -14,12 +14,22 @@ use core::cmp;
 use log::{debug, trace};
 
 use crate::{
-    cache::Cache,
-    deflate::{calculate_block_size, BlockType},
+    bintree::BinaryTree,
+    cache::{Cache, NoCache},
+    deflate::{calculate_block_size, optimize_huffman_for_rle, BlockType},
     hash::ZopfliHash,
-    lz77::{find_longest_match, LitLen, Lz77Store},
+    katajainen::length_limited_code_lengths,
+    lz77::{
+        find_longest_match, find_longest_match_loop, get_length_score, verify_len_dist, LitLen,
+        Lz77Store,
+    },
+    matches::{MatchCache, Matches},
     symbols::{get_dist_extra_bits, get_dist_symbol, get_length_extra_bits, get_length_symbol},
-    util::{ZOPFLI_MAX_MATCH, ZOPFLI_NUM_D, ZOPFLI_NUM_LL, ZOPFLI_WINDOW_MASK, ZOPFLI_WINDOW_SIZE},
+    util::{
+        ZOPFLI_MAX_MATCH, ZOPFLI_MIN_MATCH, ZOPFLI_NUM_D, ZOPFLI_NUM_LL, ZOPFLI_WINDOW_MASK,
+        ZOPFLI_WINDOW_SIZE,
+    },
+    Options,
 };
 
 #[cfg(not(feature = "std"))]
@@ -109,7 +119,7 @@ impl SymbolStats {
             let end = n;
 
             while i < end {
-                if (state.random_marsaglia() >> 4) % 3 == 0 {
+                if (state.random_marsaglia() >> 4).is_multiple_of(3) {
                     let index = state.random_marsaglia() as usize % n;
                     freqs[i] = freqs[index];
                 }
@@ -166,6 +176,30 @@ impl SymbolStats {
         self.calculate_entropy();
     }
 
+    /// Sets the costs to the code lengths a dynamic block would use for these
+    /// counts (after the RLE adjustment of the counts). A symbol without a code
+    /// gets the longest code length, 15 bits: using it would need a new code.
+    fn use_code_lengths(&mut self, from: &Self) {
+        let mut litlens = from.litlens;
+        let mut dists = from.dists;
+        optimize_huffman_for_rle(&mut dists);
+        optimize_huffman_for_rle(&mut litlens);
+        for (cost, bits) in self
+            .ll_symbols
+            .iter_mut()
+            .zip(length_limited_code_lengths(&litlens, 15))
+        {
+            *cost = if bits == 0 { 15.0 } else { f64::from(bits) };
+        }
+        for (cost, bits) in self
+            .d_symbols
+            .iter_mut()
+            .zip(length_limited_code_lengths(&dists, 15))
+        {
+            *cost = if bits == 0 { 15.0 } else { f64::from(bits) };
+        }
+    }
+
     fn clear_freqs(&mut self) {
         self.litlens = [0; ZOPFLI_NUM_LL];
         self.dists = [0; ZOPFLI_NUM_D];
@@ -191,6 +225,15 @@ fn add_weighed_stat_freqs(
     result
 }
 
+// Table of distances that have a different distance symbol in the deflate
+// specification. Each value is the first distance that has a new symbol. Only
+// different symbols affect the cost model so only these need to be checked.
+// See RFC 1951 section 3.2.5. Compressed blocks (length and distance codes).
+const DSYMBOLS: [u16; 30] = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+];
+
 /// Finds the minimum possible cost this cost model can return for valid length and
 /// distance symbols.
 fn get_cost_model_min_cost<F: Fn(usize, u16) -> f64>(costmodel: F) -> f64 {
@@ -201,11 +244,6 @@ fn get_cost_model_min_cost<F: Fn(usize, u16) -> f64>(costmodel: F) -> f64 {
     // specification. Each value is the first distance that has a new symbol. Only
     // different symbols affect the cost model so only these need to be checked.
     // See RFC 1951 section 3.2.5. Compressed blocks (length and distance codes).
-
-    const DSYMBOLS: [u16; 30] = [
-        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
-        2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
-    ];
 
     let mut mincost = f64::INFINITY;
     for i in 3..259 {
@@ -344,16 +382,466 @@ fn get_best_lengths<F: Fn(usize, u16) -> f64, C: Cache>(
     (f64::from(costs[blocksize]), length_array)
 }
 
+/// Finds the matches `get_best_lengths` would look at in the block, with the
+/// same search, and keeps them.
+fn fill_match_cache(
+    in_data: &[u8],
+    instart: usize,
+    inend: usize,
+    h: &mut ZopfliHash,
+) -> MatchCache {
+    let mut m = MatchCache::new(inend - instart);
+    if instart == inend {
+        return m;
+    }
+    let windowstart = instart.saturating_sub(ZOPFLI_WINDOW_SIZE);
+    h.reset();
+    let arr = &in_data[..inend];
+    h.warmup(arr, windowstart, inend);
+    for i in windowstart..instart {
+        h.update(arr, i);
+    }
+
+    let mut i = instart;
+    let mut sublen = vec![0; ZOPFLI_MAX_MATCH + 1];
+    while i < inend {
+        h.update(arr, i);
+
+        // The same test for a long repetition of one byte as in `get_best_lengths`.
+        if h.same[i & ZOPFLI_WINDOW_MASK] > ZOPFLI_MAX_MATCH as u16 * 2
+            && i > instart + ZOPFLI_MAX_MATCH + 1
+            && i + ZOPFLI_MAX_MATCH * 2 + 1 < inend
+            && h.same[(i - ZOPFLI_MAX_MATCH) & ZOPFLI_WINDOW_MASK] > ZOPFLI_MAX_MATCH as u16
+        {
+            m.mark_run(i - instart);
+            for _ in 0..ZOPFLI_MAX_MATCH {
+                let (dist, length) =
+                    find_longest_match_loop(h, arr, i, inend, ZOPFLI_MAX_MATCH, &mut None);
+                debug_assert_eq!(length as usize, ZOPFLI_MAX_MATCH);
+                m.push_one(dist, length as usize);
+                i += 1;
+                h.update(arr, i);
+            }
+        }
+
+        let longest_match = find_longest_match(
+            &mut NoCache,
+            h,
+            arr,
+            i,
+            inend,
+            instart,
+            ZOPFLI_MAX_MATCH,
+            &mut Some(&mut sublen),
+        );
+        m.push(&sublen, longest_match.length as usize);
+        i += 1;
+    }
+    debug_assert!(m.is_filled());
+    m
+}
+
+/// Where `get_best_lengths` skips through a long repetition of one byte, found
+/// from the data alone.
+struct LongRuns {
+    instart: usize,
+    inend: usize,
+    runstart: usize,
+    /// How many bytes after each position repeat its byte, from
+    /// `ZOPFLI_MAX_MATCH` before the block on.
+    same: Vec<u16>,
+}
+
+impl LongRuns {
+    /// The runs of `arr[instart..inend]`, in the vector `same`.
+    fn new_in(mut same: Vec<u16>, arr: &[u8], instart: usize, inend: usize) -> Self {
+        let runstart = instart.saturating_sub(ZOPFLI_MAX_MATCH);
+        same.clear();
+        same.resize(inend - runstart, 0);
+        for i in (runstart..inend.saturating_sub(1)).rev() {
+            if arr[i] == arr[i + 1] {
+                same[i - runstart] = same[i + 1 - runstart].saturating_add(1);
+            }
+        }
+        Self {
+            instart,
+            inend,
+            runstart,
+            same,
+        }
+    }
+
+    /// Whether the byte before `i` and the bytes from `i` up to the longest
+    /// match there are all the same (see `BinaryTree::insert`).
+    fn repeats_before(&self, i: usize) -> bool {
+        let limit = cmp::min(ZOPFLI_MAX_MATCH, self.inend - i);
+        i > self.runstart && usize::from(self.same[i - 1 - self.runstart]) >= limit
+    }
+
+    /// The same test as in `get_best_lengths`; then the `ZOPFLI_MAX_MATCH`
+    /// positions from `i` on all have a match of that length at distance 1.
+    fn starts_at(&self, i: usize) -> bool {
+        self.starts_within(i, self.instart, self.inend)
+    }
+
+    /// `starts_at` for the block `instart..inend` within these runs' range.
+    fn starts_within(&self, i: usize, instart: usize, inend: usize) -> bool {
+        self.same[i - self.runstart] > ZOPFLI_MAX_MATCH as u16 * 2
+            && i > instart + ZOPFLI_MAX_MATCH + 1
+            && i + ZOPFLI_MAX_MATCH * 2 + 1 < inend
+            && self.same[i - ZOPFLI_MAX_MATCH - self.runstart] > ZOPFLI_MAX_MATCH as u16
+    }
+}
+
+/// The matches of a chunk, from `fill_match_cache_tree`, with the long
+/// repetitions in it.
+pub struct ChunkMatches {
+    cache: MatchCache,
+    runs: LongRuns,
+    tree: BinaryTree,
+}
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// The vectors of the last chunk's matches on this thread, for the next chunk.
+    static SPARE: core::cell::RefCell<Option<ChunkMatches>> = const { core::cell::RefCell::new(None) };
+}
+
+impl ChunkMatches {
+    /// Keeps the vectors for the next `fill_match_cache_tree` on this thread.
+    pub fn recycle(self) {
+        #[cfg(feature = "std")]
+        SPARE.with(|spare| *spare.borrow_mut() = Some(self));
+    }
+
+    /// Where the chunk starts in the input.
+    pub fn start(&self) -> usize {
+        self.runs.instart
+    }
+
+    /// The chunk's matches, chunk positions from 0.
+    pub fn cache(&self) -> &MatchCache {
+        &self.cache
+    }
+
+    /// The block `instart..inend` of the chunk, as `lz77_optimal` reads it:
+    /// long repetitions as for the block alone, matches cut at its end.
+    pub fn block(&self, instart: usize, inend: usize) -> ChunkView<'_> {
+        ChunkView {
+            chunk: self,
+            instart,
+            inend,
+        }
+    }
+}
+
+/// A block of a `ChunkMatches`, see `ChunkMatches::block`.
+pub struct ChunkView<'a> {
+    chunk: &'a ChunkMatches,
+    instart: usize,
+    inend: usize,
+}
+
+impl Matches for ChunkView<'_> {
+    fn is_run(&self, pos: usize) -> bool {
+        // The run lengths of the chunk give the block's test: its thresholds
+        // lie below where the block's end would cut them.
+        self.chunk
+            .runs
+            .starts_within(self.instart + pos, self.instart, self.inend)
+    }
+
+    fn matches(&self, pos: usize) -> &[u32] {
+        self.chunk
+            .cache
+            .matches(self.instart - self.chunk.start() + pos)
+    }
+
+    fn longest(&self, pos: usize) -> (u16, u16) {
+        let room = (self.inend - self.instart - pos) as u32;
+        if room < ZOPFLI_MIN_MATCH as u32 {
+            return (0, 0);
+        }
+        let mut longest = (0, 0);
+        for &e in self.matches(pos) {
+            longest = (cmp::min(e >> 16, room) as u16, e as u16);
+            if e >> 16 >= room {
+                break;
+            }
+        }
+        longest
+    }
+}
+
+/// Fills a match cache with a binary tree match finder; skips through long
+/// repetitions of one byte like `fill_match_cache`, with matches at distance 1.
+pub fn fill_match_cache_tree(in_data: &[u8], instart: usize, inend: usize) -> ChunkMatches {
+    #[cfg(feature = "std")]
+    let spare = SPARE.with(|spare| spare.borrow_mut().take());
+    #[cfg(not(feature = "std"))]
+    let spare: Option<ChunkMatches> = None;
+    let windowstart = instart.saturating_sub(ZOPFLI_WINDOW_SIZE);
+    let (mut m, same, mut tree) = match spare {
+        Some(c) => (
+            c.cache.reuse(inend - instart),
+            c.runs.same,
+            c.tree.reuse(windowstart),
+        ),
+        None => (
+            MatchCache::new(inend - instart),
+            Vec::new(),
+            BinaryTree::new(windowstart),
+        ),
+    };
+    if instart == inend {
+        return ChunkMatches {
+            cache: m,
+            runs: LongRuns::new_in(same, in_data, instart, inend),
+            tree,
+        };
+    }
+    let arr = &in_data[..inend];
+    for i in windowstart..instart {
+        tree.insert(arr, i, inend, false, None);
+    }
+
+    let runs_at = LongRuns::new_in(same, arr, instart, inend);
+    let mut runs = Vec::with_capacity(ZOPFLI_MAX_MATCH);
+    let mut i = instart;
+    while i < inend {
+        if runs_at.starts_at(i) {
+            m.mark_run(i - instart);
+            for _ in 0..ZOPFLI_MAX_MATCH {
+                tree.insert(arr, i, inend, runs_at.repeats_before(i), None);
+                m.push_one(1, ZOPFLI_MAX_MATCH);
+                i += 1;
+            }
+        }
+        runs.clear();
+        tree.insert(arr, i, inend, runs_at.repeats_before(i), Some(&mut runs));
+        m.push_runs(&runs);
+        i += 1;
+    }
+    debug_assert!(m.is_filled());
+    ChunkMatches {
+        cache: m,
+        runs: runs_at,
+        tree,
+    }
+}
+
+/// Does the same as `Lz77Store::greedy` for a block whose matches are all in `m`.
+pub fn greedy_cached<M: Matches + ?Sized>(
+    store: &mut Lz77Store,
+    m: &M,
+    in_data: &[u8],
+    instart: usize,
+    inend: usize,
+) {
+    let mut i = instart;
+    let mut prev_length = 0;
+    let mut prev_match = 0;
+    let mut match_available = false;
+    while i < inend {
+        let (mut leng, mut dist) = m.longest(i - instart);
+        let lengthscore = get_length_score(i32::from(leng), i32::from(dist));
+
+        /* Lazy matching. */
+        let prevlengthscore = get_length_score(i32::from(prev_length), i32::from(prev_match));
+        if match_available {
+            match_available = false;
+            if lengthscore > prevlengthscore + 1 {
+                store.lit_len_dist(u16::from(in_data[i - 1]), 0, i - 1);
+                if (lengthscore as usize) >= ZOPFLI_MIN_MATCH && (leng as usize) < ZOPFLI_MAX_MATCH
+                {
+                    match_available = true;
+                    prev_length = leng;
+                    prev_match = dist;
+                    i += 1;
+                    continue;
+                }
+            } else {
+                /* Add previous to output. */
+                verify_len_dist(in_data, i - 1, prev_match, prev_length);
+                store.lit_len_dist(prev_length, prev_match, i - 1);
+                i += prev_length as usize - 1;
+                continue;
+            }
+        } else if (lengthscore as usize) >= ZOPFLI_MIN_MATCH && (leng as usize) < ZOPFLI_MAX_MATCH {
+            match_available = true;
+            prev_length = leng;
+            prev_match = dist;
+            i += 1;
+            continue;
+        }
+        /* End of lazy matching. */
+
+        /* Add to output. */
+        if (lengthscore as usize) >= ZOPFLI_MIN_MATCH {
+            verify_len_dist(in_data, i, dist, leng);
+            store.lit_len_dist(leng, dist, i);
+        } else {
+            leng = 1;
+            dist = 0;
+            store.lit_len_dist(u16::from(in_data[i]), dist, i);
+        }
+        i += leng as usize;
+    }
+}
+
+/// Does the same as `get_best_lengths` for a block whose matches are all in `m`.
+fn get_best_lengths_cached<F: Fn(usize, u16) -> f64, M: Matches + ?Sized>(
+    m: &M,
+    in_data: &[u8],
+    instart: usize,
+    inend: usize,
+    costmodel: F,
+    buffers: &mut PassBuffers,
+) -> f64 {
+    let PassBuffers {
+        costs,
+        length_array,
+        match_costs,
+        ..
+    } = buffers;
+    let blocksize = inend - instart;
+    length_array.clear();
+    length_array.resize(blocksize + 1, 0);
+    if instart == inend {
+        return 0.0;
+    }
+
+    costs.resize(blocksize + 1, 0.0);
+    for cost in costs.iter_mut().take(blocksize + 1).skip(1) {
+        *cost = f32::INFINITY;
+    }
+    costs[0] = 0.0;
+
+    // The cost of a match depends only on its length and distance symbol, so it
+    // is looked up instead of computed at every position.
+    match_costs.clear();
+    match_costs.resize(DSYMBOLS.len() * (ZOPFLI_MAX_MATCH + 1), 0.0);
+    for (row, &dist) in match_costs
+        .as_chunks_mut::<{ ZOPFLI_MAX_MATCH + 1 }>()
+        .0
+        .iter_mut()
+        .zip(&DSYMBOLS)
+    {
+        for (k, cost) in row.iter_mut().enumerate().skip(ZOPFLI_MIN_MATCH) {
+            *cost = costmodel(k, dist);
+        }
+    }
+    let mut literal_costs = [0.0; 256];
+    for (c, cost) in literal_costs.iter_mut().enumerate() {
+        *cost = costmodel(c, 0);
+    }
+
+    let mincost = get_cost_model_min_cost(&costmodel);
+    let mut j = 0;
+    while j < blocksize {
+        if m.is_run(j) {
+            let symbolcost = costmodel(ZOPFLI_MAX_MATCH, 1);
+            for _ in 0..ZOPFLI_MAX_MATCH {
+                costs[j + ZOPFLI_MAX_MATCH] = costs[j] + symbolcost as f32;
+                length_array[j + ZOPFLI_MAX_MATCH] = ZOPFLI_MAX_MATCH as u16;
+                j += 1;
+            }
+        }
+        let i = instart + j;
+        let costj = f64::from(costs[j]);
+
+        // Literal.
+        let new_cost = literal_costs[in_data[i] as usize] + costj;
+        debug_assert!(new_cost >= 0.0);
+        if new_cost < f64::from(costs[j + 1]) {
+            costs[j + 1] = new_cost as f32;
+            length_array[j + 1] = 1;
+        }
+        // Lengths. Like `get_best_lengths`, leaves alone every length whose cost
+        // is already at most that of the cheapest match; both tests are
+        // combined without branches.
+        let mincostaddcostj = mincost + costj;
+        let kend = inend - i;
+        let mut k = ZOPFLI_MIN_MATCH;
+        for &e in m.matches(j) {
+            let last = cmp::min((e >> 16) as usize, kend);
+            if last < k {
+                break;
+            }
+            let dsym = get_dist_symbol(e as u16) as usize;
+            let row = &match_costs[dsym * (ZOPFLI_MAX_MATCH + 1) + k..][..=last - k];
+            let reach = &mut costs[j + k..=j + last];
+            let lengths = &mut length_array[j + k..=j + last];
+            for (n, ((&cost, old), length)) in row.iter().zip(reach).zip(lengths).enumerate() {
+                let new_cost = cost + costj;
+                let better = (f64::from(*old) > mincostaddcostj) & (new_cost < f64::from(*old));
+                *old = if better { new_cost as f32 } else { *old };
+                *length = if better { (k + n) as u16 } else { *length };
+            }
+            k = last + 1;
+        }
+        j += 1;
+    }
+
+    debug_assert!(costs[blocksize] >= 0.0);
+    f64::from(costs[blocksize])
+}
+
+/// The buffers of the passes over a block, made once for all of them.
+#[derive(Default)]
+struct PassBuffers {
+    costs: Vec<f32>,
+    length_array: Vec<u16>,
+    path: Vec<u16>,
+    match_costs: Vec<f64>,
+}
+
+impl PassBuffers {
+    /// One pass: the shortest path through the block with `costmodel`, into `store`.
+    fn parse<F: Fn(usize, u16) -> f64, M: Matches + ?Sized>(
+        &mut self,
+        store: &mut Lz77Store,
+        m: &M,
+        in_data: &[u8],
+        instart: usize,
+        inend: usize,
+        costmodel: F,
+    ) {
+        get_best_lengths_cached(m, in_data, instart, inend, costmodel, self);
+        trace(inend - instart, &self.length_array, &mut self.path);
+        follow_path_cached(store, m, in_data, instart, &self.path);
+    }
+}
+
+/// Does the same as `Lz77Store::follow_path` for a block whose matches are all in `m`.
+fn follow_path_cached<M: Matches + ?Sized>(
+    store: &mut Lz77Store,
+    m: &M,
+    in_data: &[u8],
+    instart: usize,
+    path: &[u16],
+) {
+    let mut pos = instart;
+    for &length in path.iter().rev() {
+        if length >= ZOPFLI_MIN_MATCH as u16 {
+            let dist = m.dist(pos - instart, length);
+            verify_len_dist(in_data, pos, dist, length);
+            store.lit_len_dist(length, dist, pos);
+            pos += length as usize;
+        } else {
+            store.lit_len_dist(u16::from(in_data[pos]), 0, pos);
+            pos += 1;
+        }
+    }
+}
+
 /// Calculates the optimal path of lz77 lengths to use, from the calculated
 /// `length_array`. The `length_array` must contain the optimal length to reach that
 /// byte. The path will be filled with the lengths to use, so its data size will be
 /// the amount of lz77 symbols.
-fn trace(size: usize, length_array: &[u16]) -> Vec<u16> {
+fn trace(size: usize, length_array: &[u16], path: &mut Vec<u16>) {
     let mut index = size;
-    if size == 0 {
-        return vec![];
-    }
-    let mut path = Vec::with_capacity(index);
+    path.clear();
 
     while index > 0 {
         let lai = length_array[index];
@@ -364,8 +852,6 @@ fn trace(size: usize, length_array: &[u16]) -> Vec<u16> {
         debug_assert_ne!(lai, 0);
         index -= laiu;
     }
-
-    path
 }
 
 /// Does a single run for `lz77_optimal`. For good compression, repeated runs
@@ -391,7 +877,8 @@ fn lz77_optimal_run<F: Fn(usize, u16) -> f64, C: Cache>(
     costs: &mut Vec<f32>,
 ) {
     let (cost, length_array) = get_best_lengths(lmc, in_data, instart, inend, costmodel, h, costs);
-    let path = trace(inend - instart, &length_array);
+    let mut path = Vec::new();
+    trace(inend - instart, &length_array, &mut path);
     store.follow_path(in_data, instart, inend, path, lmc);
     debug_assert!(cost < f64::INFINITY);
 }
@@ -424,28 +911,67 @@ pub fn lz77_optimal_fixed<C: Cache>(
     );
 }
 
+/// Whether `lz77_optimal` keeps the matches of a block of `size` positions in a
+/// `MatchCache`.
+pub fn uses_match_cache(options: &Options, size: usize) -> bool {
+    options.match_cache && MatchCache::fits(size)
+}
+
 /// Calculates lit/len and dist pairs for given data.
 /// If `instart` is larger than 0, it uses values before `instart` as starting
 /// dictionary.
+/// `chunk`: the block's matches, taken from those of the chunk around it.
 pub fn lz77_optimal<C: Cache>(
     lmc: &mut C,
     in_data: &[u8],
     instart: usize,
     inend: usize,
-    max_iterations: u64,
-    max_iterations_without_improvement: u64,
+    options: &Options,
+    chunk: Option<ChunkView<'_>>,
 ) -> Lz77Store {
+    if let Some(m) = chunk {
+        return lz77_optimal_with(lmc, in_data, instart, inend, options, Some(&m));
+    }
+    if !uses_match_cache(options, inend - instart) {
+        return lz77_optimal_with::<C, MatchCache>(lmc, in_data, instart, inend, options, None);
+    }
+    if options.tree_match_finder {
+        let c = fill_match_cache_tree(in_data, instart, inend);
+        let m = c.block(instart, inend);
+        lz77_optimal_with(lmc, in_data, instart, inend, options, Some(&m))
+    } else {
+        let m = fill_match_cache(in_data, instart, inend, &mut ZopfliHash::new());
+        lz77_optimal_with(lmc, in_data, instart, inend, options, Some(&m))
+    }
+}
+
+/// `lz77_optimal` with the block's matches in `matches`, or searched in every
+/// pass if `None`.
+fn lz77_optimal_with<C: Cache, M: Matches>(
+    lmc: &mut C,
+    in_data: &[u8],
+    instart: usize,
+    inend: usize,
+    options: &Options,
+    matches: Option<&M>,
+) -> Lz77Store {
+    let max_iterations = options.iteration_count.get();
+    let max_iterations_without_improvement = options.iterations_without_improvement.get();
+    // Only the passes without the match cache search, with this hash.
+    let mut h = matches.is_none().then(ZopfliHash::new);
     /* Dist to get to here with smallest cost. */
     let mut currentstore = Lz77Store::new();
     let mut outputstore = currentstore.clone();
 
     /* Initial run. */
-    currentstore.greedy(lmc, in_data, instart, inend);
+    match matches {
+        None => currentstore.greedy(lmc, in_data, instart, inend),
+        Some(m) => greedy_cached(&mut currentstore, m, in_data, instart, inend),
+    }
     let mut stats = SymbolStats::default();
     stats.get_statistics(&currentstore);
 
-    let mut h = ZopfliHash::new();
-    let mut costs = Vec::with_capacity(inend - instart + 1);
+    let mut buffers = PassBuffers::default();
 
     let mut beststats = SymbolStats::default();
 
@@ -463,22 +989,26 @@ pub fn lz77_optimal<C: Cache>(
     let mut iterations_without_improvement: u64 = 0;
     loop {
         currentstore.reset();
-        lz77_optimal_run(
-            lmc,
-            in_data,
-            instart,
-            inend,
-            |a, b| get_cost_stat(a, b, &stats),
-            &mut currentstore,
-            &mut h,
-            &mut costs,
-        );
+        let costmodel = |a, b| get_cost_stat(a, b, &stats);
+        match matches {
+            None => lz77_optimal_run(
+                lmc,
+                in_data,
+                instart,
+                inend,
+                costmodel,
+                &mut currentstore,
+                h.as_mut().unwrap(),
+                &mut buffers.costs,
+            ),
+            Some(m) => buffers.parse(&mut currentstore, m, in_data, instart, inend, costmodel),
+        }
         let cost = calculate_block_size(&currentstore, 0, currentstore.size(), BlockType::Dynamic);
 
         if cost < bestcost {
             iterations_without_improvement = 0;
             /* Copy to the output store. */
-            outputstore = currentstore.clone();
+            outputstore.clone_from(&currentstore);
             beststats = stats;
             bestcost = cost;
 
@@ -513,5 +1043,110 @@ pub fn lz77_optimal<C: Cache>(
         }
         lastcost = cost;
     }
+
+    if let (true, Some(m)) = (options.code_length_passes, matches) {
+        loop {
+            let mut counts = SymbolStats::default();
+            counts.get_statistics(&outputstore);
+            stats.use_code_lengths(&counts);
+            currentstore.reset();
+            buffers.parse(&mut currentstore, m, in_data, instart, inend, |a, b| {
+                get_cost_stat(a, b, &stats)
+            });
+            let cost =
+                calculate_block_size(&currentstore, 0, currentstore.size(), BlockType::Dynamic);
+            if cost >= bestcost {
+                break;
+            }
+            debug!("Code length pass: {cost} bit");
+            bestcost = cost;
+            outputstore.clone_from(&currentstore);
+        }
+    }
     outputstore
+}
+
+#[cfg(all(test, feature = "std"))]
+mod test {
+    use std::num::NonZeroU64;
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// The block's own match cache made from the chunk's: long repetitions found
+    /// for the block alone, matches cut at its end.
+    fn block_copy(
+        chunk: &ChunkMatches,
+        in_data: &[u8],
+        instart: usize,
+        inend: usize,
+    ) -> MatchCache {
+        let mut m = MatchCache::new(inend - instart);
+        let runs_at = LongRuns::new_in(Vec::new(), &in_data[..inend], instart, inend);
+        let mut runs = Vec::with_capacity(ZOPFLI_MAX_MATCH);
+        let mut i = instart;
+        while i < inend {
+            if runs_at.starts_at(i) {
+                m.mark_run(i - instart);
+                for _ in 0..ZOPFLI_MAX_MATCH {
+                    m.push_one(1, ZOPFLI_MAX_MATCH);
+                    i += 1;
+                }
+            }
+            let room = (inend - i) as u32;
+            runs.clear();
+            if room >= ZOPFLI_MIN_MATCH as u32 {
+                for &e in chunk.cache().matches(i - chunk.start()) {
+                    if e >> 16 >= room {
+                        runs.push(room << 16 | (e & 0xFFFF));
+                        break;
+                    }
+                    runs.push(e);
+                }
+            }
+            m.push_runs(&runs);
+            i += 1;
+        }
+        m
+    }
+
+    fn symbols(store: &Lz77Store) -> Vec<(u16, u16)> {
+        store
+            .litlens
+            .iter()
+            .map(|l| match *l {
+                LitLen::Literal(c) => (c, 0),
+                LitLen::LengthDist(len, dist) => (len, dist),
+            })
+            .collect()
+    }
+
+    proptest! {
+        #[test]
+        fn a_block_reads_the_chunk_matches_like_its_own_copy(
+            runs in prop::collection::vec((0u8..4, 1usize..800), 1..60),
+            cuts in prop::collection::vec(0.0..1.0f64, 3),
+        ) {
+            let data: Vec<u8> = runs.iter().flat_map(|&(b, n)| core::iter::repeat_n(b, n)).collect();
+            let mut at: Vec<usize> = cuts.iter().map(|&c| (c * data.len() as f64) as usize).collect();
+            at.sort_unstable();
+            let (chunkstart, instart, inend) = (at[0], at[1], at[2]);
+            let chunk = fill_match_cache_tree(&data, chunkstart, data.len());
+            let copy = block_copy(&chunk, &data, instart, inend);
+            let view = chunk.block(instart, inend);
+            let options = Options {
+                iteration_count: NonZeroU64::new(3).unwrap(),
+                code_length_passes: true,
+                ..Options::default()
+            };
+            let a = lz77_optimal_with(&mut NoCache, &data, instart, inend, &options, Some(&copy));
+            let b = lz77_optimal_with(&mut NoCache, &data, instart, inend, &options, Some(&view));
+            prop_assert_eq!(symbols(&a), symbols(&b));
+            let (mut a, mut b) = (Lz77Store::new(), Lz77Store::new());
+            greedy_cached(&mut a, &copy, &data, instart, inend);
+            greedy_cached(&mut b, &view, &data, instart, inend);
+            prop_assert_eq!(symbols(&a), symbols(&b));
+        }
+    }
 }
