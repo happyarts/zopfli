@@ -6,7 +6,6 @@ use log::{debug, log_enabled};
 
 use crate::{
     blocksplitter::{blocksplit, blocksplit_lz77},
-    cache::ZopfliLongestMatchCache,
     iter::ToFlagLastIterator,
     katajainen::length_limited_code_lengths,
     lz77::{LitLen, Lz77Store},
@@ -215,13 +214,7 @@ fn deflate_part<W: Write>(
         BlockType::Fixed => {
             let mut store = Lz77Store::new();
 
-            lz77_optimal_fixed(
-                &mut ZopfliLongestMatchCache::new(inend - instart),
-                in_data,
-                instart,
-                inend,
-                &mut store,
-            );
+            lz77_optimal_fixed(in_data, instart, inend, &mut store);
             add_lz77_block(
                 btype,
                 final_block,
@@ -1086,13 +1079,7 @@ fn add_lz77_block_auto_type<W: Write>(
         let instart = lz77.pos[lstart];
         let inend = instart + lz77.get_byte_range(lstart, lend);
 
-        lz77_optimal_fixed(
-            &mut ZopfliLongestMatchCache::new(inend - instart),
-            in_data,
-            instart,
-            inend,
-            &mut fixedstore,
-        );
+        lz77_optimal_fixed(in_data, instart, inend, &mut fixedstore);
         fixedcost = calculate_block_size(&fixedstore, 0, fixedstore.size(), BlockType::Fixed);
     }
 
@@ -1209,7 +1196,6 @@ fn blocksplit_attempt<W: Write>(
     let mut last = instart;
     for &item in &splitpoints_uncompressed {
         let store = lz77_optimal(
-            &mut ZopfliLongestMatchCache::new(item - last),
             in_data,
             last,
             item,
@@ -1230,7 +1216,6 @@ fn blocksplit_attempt<W: Write>(
     }
 
     let store = lz77_optimal(
-        &mut ZopfliLongestMatchCache::new(inend - last),
         in_data,
         last,
         inend,

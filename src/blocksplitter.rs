@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "std")]
 use log::{debug, log_enabled};
 
-use crate::{cache::NoCache, deflate::calculate_block_size_auto_type, lz77::Lz77Store};
+use crate::{deflate::calculate_block_size_auto_type, lz77::Lz77Store};
 
 /// Finds minimum of function `f(i)` where `i` is of type `usize`, `f(i)` is of type
 /// `f64`, `i` is in range `start-end` (excluding `end`).
@@ -225,7 +225,7 @@ pub fn blocksplit(
     /* Unintuitively, Using a simple LZ77 method here instead of lz77_optimal
     results in better blocks. */
     {
-        store.greedy(&mut NoCache, in_data, instart, inend);
+        store.greedy(in_data, instart, inend);
     }
 
     let mut lz77splitpoints = Vec::with_capacity(maxblocks as usize);
