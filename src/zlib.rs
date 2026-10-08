@@ -31,6 +31,16 @@ impl<W: Write> ZlibEncoder<W> {
         })
     }
 
+    /// Works out the chunks on up to `threads` threads at the same time; see
+    /// [`DeflateEncoder::with_threads`].
+    #[cfg(feature = "std")]
+    pub fn with_threads(mut self, threads: core::num::NonZeroUsize) -> Self {
+        if let Some(encoder) = self.deflate_encoder.as_mut() {
+            encoder.set_threads(threads);
+        }
+        self
+    }
+
     /// Creates a new Zlib encoder that operates according to the specified
     /// options and is wrapped with a buffer to guarantee that data is
     /// compressed in large chunks, which is necessary for decent performance
