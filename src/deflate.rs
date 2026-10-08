@@ -461,8 +461,8 @@ fn calculate_block_symbol_size(
     } else {
         let (ll_counts, d_counts) = lz77.get_histogram(lstart, lend);
         calculate_block_symbol_size_given_counts(
-            &*ll_counts,
-            &*d_counts,
+            &ll_counts[..],
+            &d_counts[..],
             ll_lengths,
             d_lengths,
             lz77,
@@ -932,8 +932,12 @@ fn try_optimize_huffman_for_rle(
     ll_lengths: Vec<u32>,
     d_lengths: Vec<u32>,
 ) -> (f64, Vec<u32>, Vec<u32>) {
-    let mut ll_counts2 = Vec::from(ll_counts);
-    let mut d_counts2 = Vec::from(d_counts);
+    let mut ll_counts2 = [0; ZOPFLI_NUM_LL];
+    let ll_counts2 = &mut ll_counts2[..ll_counts.len()];
+    ll_counts2.copy_from_slice(ll_counts);
+    let mut d_counts2 = [0; ZOPFLI_NUM_D];
+    let d_counts2 = &mut d_counts2[..d_counts.len()];
+    d_counts2.copy_from_slice(d_counts);
 
     let treesize = calculate_tree_size(&ll_lengths, &d_lengths);
     let datasize = calculate_block_symbol_size_given_counts(
@@ -946,11 +950,11 @@ fn try_optimize_huffman_for_rle(
         lend,
     );
 
-    optimize_huffman_for_rle(&mut ll_counts2);
-    optimize_huffman_for_rle(&mut d_counts2);
+    optimize_huffman_for_rle(ll_counts2);
+    optimize_huffman_for_rle(d_counts2);
 
-    let ll_lengths2 = length_limited_code_lengths(&ll_counts2, 15);
-    let mut d_lengths2 = length_limited_code_lengths(&d_counts2, 15);
+    let ll_lengths2 = length_limited_code_lengths(ll_counts2, 15);
+    let mut d_lengths2 = length_limited_code_lengths(d_counts2, 15);
     patch_distance_codes_for_buggy_decoders(&mut d_lengths2[..]);
 
     let treesize2 = calculate_tree_size(&ll_lengths2, &d_lengths2);
@@ -980,8 +984,8 @@ fn get_dynamic_lengths(lz77: &Lz77Store, lstart: usize, lend: usize) -> (f64, Ve
     let (mut ll_counts, d_counts) = lz77.get_histogram(lstart, lend);
     ll_counts[256] = 1; /* End symbol. */
 
-    let ll_lengths = length_limited_code_lengths(&*ll_counts, 15);
-    let mut d_lengths = length_limited_code_lengths(&*d_counts, 15);
+    let ll_lengths = length_limited_code_lengths(&ll_counts[..], 15);
+    let mut d_lengths = length_limited_code_lengths(&d_counts[..], 15);
 
     patch_distance_codes_for_buggy_decoders(&mut d_lengths[..]);
 
@@ -989,8 +993,8 @@ fn get_dynamic_lengths(lz77: &Lz77Store, lstart: usize, lend: usize) -> (f64, Ve
         lz77,
         lstart,
         lend,
-        &*ll_counts,
-        &*d_counts,
+        &ll_counts[..],
+        &d_counts[..],
         ll_lengths,
         d_lengths,
     )
