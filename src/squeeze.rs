@@ -14,12 +14,15 @@ use core::cmp;
 use log::{debug, trace};
 
 use crate::{
-    cache::Cache,
     deflate::{calculate_block_size, BlockType},
     hash::ZopfliHash,
-    lz77::{find_longest_match, LitLen, Lz77Store},
+    lz77::{find_longest_match, verify_len_dist, LitLen, Lz77Store},
+    matches::MatchCache,
     symbols::{get_dist_extra_bits, get_dist_symbol, get_length_extra_bits, get_length_symbol},
-    util::{ZOPFLI_MAX_MATCH, ZOPFLI_NUM_D, ZOPFLI_NUM_LL, ZOPFLI_WINDOW_MASK, ZOPFLI_WINDOW_SIZE},
+    util::{
+        ZOPFLI_MAX_MATCH, ZOPFLI_MIN_MATCH, ZOPFLI_NUM_D, ZOPFLI_NUM_LL, ZOPFLI_WINDOW_MASK,
+        ZOPFLI_WINDOW_SIZE,
+    },
 };
 
 #[cfg(not(feature = "std"))]
@@ -191,21 +194,20 @@ fn add_weighed_stat_freqs(
     result
 }
 
+// Table of distances that have a different distance symbol in the deflate
+// specification. Each value is the first distance that has a new symbol. Only
+// different symbols affect the cost model so only these need to be checked.
+// See RFC 1951 section 3.2.5. Compressed blocks (length and distance codes).
+const DSYMBOLS: [u16; 30] = [
+    1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
+    2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
+];
+
 /// Finds the minimum possible cost this cost model can return for valid length and
 /// distance symbols.
 fn get_cost_model_min_cost<F: Fn(usize, u16) -> f64>(costmodel: F) -> f64 {
     let mut bestlength = 0; // length that has lowest cost in the cost model
     let mut bestdist = 0; // distance that has lowest cost in the cost model
-
-    // Table of distances that have a different distance symbol in the deflate
-    // specification. Each value is the first distance that has a new symbol. Only
-    // different symbols affect the cost model so only these need to be checked.
-    // See RFC 1951 section 3.2.5. Compressed blocks (length and distance codes).
-
-    const DSYMBOLS: [u16; 30] = [
-        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
-        2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
-    ];
 
     let mut mincost = f64::INFINITY;
     for i in 3..259 {
@@ -227,53 +229,27 @@ fn get_cost_model_min_cost<F: Fn(usize, u16) -> f64>(costmodel: F) -> f64 {
     costmodel(bestlength, bestdist)
 }
 
-/// Performs the forward pass for "squeeze". Gets the most optimal length to reach
-/// every byte from a previous byte, using cost calculations.
-/// `s`: the `ZopfliBlockState`
-/// `in_data`: the input data array
-/// `instart`: where to start
-/// `inend`: where to stop (not inclusive)
-/// `costmodel`: function to calculate the cost of some lit/len/dist pair.
-/// `length_array`: output array of size `(inend - instart)` which will receive the best
-///     length to reach this byte from a previous byte.
-/// returns the cost that was, according to the `costmodel`, needed to get to the end.
-fn get_best_lengths<F: Fn(usize, u16) -> f64, C: Cache>(
-    lmc: &mut C,
-    in_data: &[u8],
-    instart: usize,
-    inend: usize,
-    costmodel: F,
-    h: &mut ZopfliHash,
-    costs: &mut Vec<f32>,
-) -> (f64, Vec<u16>) {
-    // Best cost to get here so far.
-    let blocksize = inend - instart;
-    let mut length_array = vec![0; blocksize + 1];
+/// Finds the matches the forward pass looks at in the block `instart..inend`:
+/// at each position the longest match and, for every shorter length, the
+/// distance of the first match found that long. Where the forward pass skips
+/// through a long repetition of one byte, it keeps the match of
+/// `ZOPFLI_MAX_MATCH` bytes at each skipped position and marks the start.
+fn find_matches(in_data: &[u8], instart: usize, inend: usize) -> MatchCache {
+    let mut m = MatchCache::new(inend - instart);
     if instart == inend {
-        return (0.0, length_array);
+        return m;
     }
     let windowstart = instart.saturating_sub(ZOPFLI_WINDOW_SIZE);
-
-    h.reset();
+    let mut h = ZopfliHash::new();
     let arr = &in_data[..inend];
     h.warmup(arr, windowstart, inend);
     for i in windowstart..instart {
         h.update(arr, i);
     }
 
-    costs.resize(blocksize + 1, 0.0);
-    for cost in costs.iter_mut().take(blocksize + 1).skip(1) {
-        *cost = f32::INFINITY;
-    }
-    costs[0] = 0.0; /* Because it's the start. */
-
     let mut i = instart;
-    let mut leng;
-    let mut longest_match;
     let mut sublen = vec![0; ZOPFLI_MAX_MATCH + 1];
-    let mincost = get_cost_model_min_cost(&costmodel);
     while i < inend {
-        let mut j = i - instart; // Index in the costs array and length_array.
         h.update(arr, i);
 
         // If we're in a long repetition of the same character and have more than
@@ -283,65 +259,149 @@ fn get_best_lengths<F: Fn(usize, u16) -> f64, C: Cache>(
             && i + ZOPFLI_MAX_MATCH * 2 + 1 < inend
             && h.same[(i - ZOPFLI_MAX_MATCH) & ZOPFLI_WINDOW_MASK] > ZOPFLI_MAX_MATCH as u16
         {
-            let symbolcost = costmodel(ZOPFLI_MAX_MATCH, 1);
-            // Set the length to reach each one to ZOPFLI_MAX_MATCH, and the cost to
-            // the cost corresponding to that length. Doing this, we skip
-            // ZOPFLI_MAX_MATCH values to avoid calling ZopfliFindLongestMatch.
-
+            // `get_best_lengths` gives each of the next ZOPFLI_MAX_MATCH positions
+            // a match of that length; `follow_path` needs their distances.
+            m.mark_run(i - instart);
             for _ in 0..ZOPFLI_MAX_MATCH {
-                costs[j + ZOPFLI_MAX_MATCH] = costs[j] + symbolcost as f32;
-                length_array[j + ZOPFLI_MAX_MATCH] = ZOPFLI_MAX_MATCH as u16;
+                let longest_match =
+                    find_longest_match(&h, arr, i, inend, ZOPFLI_MAX_MATCH, &mut None);
+                debug_assert_eq!(longest_match.length as usize, ZOPFLI_MAX_MATCH);
+                m.push_one(longest_match.distance, ZOPFLI_MAX_MATCH);
                 i += 1;
-                j += 1;
                 h.update(arr, i);
             }
         }
 
-        longest_match = find_longest_match(
-            lmc,
-            h,
-            arr,
-            i,
-            inend,
-            instart,
-            ZOPFLI_MAX_MATCH,
-            &mut Some(&mut sublen),
-        );
-        leng = longest_match.length;
+        let longest_match =
+            find_longest_match(&h, arr, i, inend, ZOPFLI_MAX_MATCH, &mut Some(&mut sublen));
+        m.push(&sublen, longest_match.length as usize);
+        i += 1;
+    }
+    debug_assert!(m.is_filled());
+    m
+}
+
+/// Performs the forward pass for "squeeze". Gets the most optimal length to reach
+/// every byte from a previous byte, using cost calculations.
+/// `m`: the matches of the block, from `find_matches`
+/// `in_data`: the input data array
+/// `instart`: where to start
+/// `inend`: where to stop (not inclusive)
+/// `costmodel`: function to calculate the cost of some lit/len/dist pair.
+/// returns the cost that was, according to the `costmodel`, needed to get to the end,
+///     and for every byte the length that reaches it most cheaply from a previous byte.
+fn get_best_lengths<F: Fn(usize, u16) -> f64>(
+    m: &MatchCache,
+    in_data: &[u8],
+    instart: usize,
+    inend: usize,
+    costmodel: F,
+    costs: &mut Vec<f32>,
+) -> (f64, Vec<u16>) {
+    // Best cost to get here so far.
+    let blocksize = inend - instart;
+    let mut length_array = vec![0; blocksize + 1];
+    if instart == inend {
+        return (0.0, length_array);
+    }
+
+    costs.resize(blocksize + 1, 0.0);
+    for cost in costs.iter_mut().take(blocksize + 1).skip(1) {
+        *cost = f32::INFINITY;
+    }
+    costs[0] = 0.0; /* Because it's the start. */
+
+    // The cost of a match depends only on its length and distance symbol, so it
+    // is looked up instead of computed at every position.
+    let mut match_costs = vec![0.0; DSYMBOLS.len() * (ZOPFLI_MAX_MATCH + 1)];
+    for (row, &dist) in match_costs
+        .chunks_exact_mut(ZOPFLI_MAX_MATCH + 1)
+        .zip(&DSYMBOLS)
+    {
+        for (k, cost) in row.iter_mut().enumerate().skip(ZOPFLI_MIN_MATCH) {
+            *cost = costmodel(k, dist);
+        }
+    }
+    let mut literal_costs = [0.0; 256];
+    for (c, cost) in literal_costs.iter_mut().enumerate() {
+        *cost = costmodel(c, 0);
+    }
+
+    let mincost = get_cost_model_min_cost(&costmodel);
+    let mut j = 0; // Index in the costs array and length_array.
+    while j < blocksize {
+        if m.is_run(j) {
+            let symbolcost = costmodel(ZOPFLI_MAX_MATCH, 1);
+            // Set the length to reach each one to ZOPFLI_MAX_MATCH, and the cost to
+            // the cost corresponding to that length. Doing this, we skip
+            // ZOPFLI_MAX_MATCH values.
+            for _ in 0..ZOPFLI_MAX_MATCH {
+                costs[j + ZOPFLI_MAX_MATCH] = costs[j] + symbolcost as f32;
+                length_array[j + ZOPFLI_MAX_MATCH] = ZOPFLI_MAX_MATCH as u16;
+                j += 1;
+            }
+        }
+        let i = instart + j;
+        let costj = f64::from(costs[j]);
 
         // Literal.
-        if i < inend {
-            let new_cost = costmodel(arr[i] as usize, 0) + f64::from(costs[j]);
-            debug_assert!(new_cost >= 0.0);
-            if new_cost < f64::from(costs[j + 1]) {
-                costs[j + 1] = new_cost as f32;
-                length_array[j + 1] = 1;
-            }
+        let new_cost = literal_costs[in_data[i] as usize] + costj;
+        debug_assert!(new_cost >= 0.0);
+        if new_cost < f64::from(costs[j + 1]) {
+            costs[j + 1] = new_cost as f32;
+            length_array[j + 1] = 1;
         }
-        // Lengths.
-        let kend = cmp::min(leng as usize, inend - i);
-        let mincostaddcostj = mincost + f64::from(costs[j]);
-
-        for (k, &sublength) in sublen.iter().enumerate().take(kend + 1).skip(3) {
-            // Calling the cost model is expensive, avoid this if we are already at
-            // the minimum possible cost that it can return.
-            if f64::from(costs[j + k]) <= mincostaddcostj {
-                continue;
+        // Lengths. A length whose cost is already at most that of the cheapest
+        // match is left alone; both tests are combined without branches.
+        let mincostaddcostj = mincost + costj;
+        let kend = inend - i;
+        let mut k = ZOPFLI_MIN_MATCH;
+        for &e in m.matches(j) {
+            let last = cmp::min((e >> 16) as usize, kend);
+            if last < k {
+                break;
             }
-
-            let new_cost = costmodel(k, sublength) + f64::from(costs[j]);
-            debug_assert!(new_cost >= 0.0);
-            if new_cost < f64::from(costs[j + k]) {
-                debug_assert!(k <= ZOPFLI_MAX_MATCH);
-                costs[j + k] = new_cost as f32;
-                length_array[j + k] = k as u16;
+            let dsym = get_dist_symbol(e as u16) as usize;
+            let row = &match_costs[dsym * (ZOPFLI_MAX_MATCH + 1) + k..][..=last - k];
+            let reach = &mut costs[j + k..=j + last];
+            let lengths = &mut length_array[j + k..=j + last];
+            for (n, ((&cost, old), length)) in row.iter().zip(reach).zip(lengths).enumerate() {
+                let new_cost = cost + costj;
+                debug_assert!(new_cost >= 0.0);
+                let better = (f64::from(*old) > mincostaddcostj) & (new_cost < f64::from(*old));
+                *old = if better { new_cost as f32 } else { *old };
+                *length = if better { (k + n) as u16 } else { *length };
             }
+            k = last + 1;
         }
-        i += 1;
+        j += 1;
     }
 
     debug_assert!(costs[blocksize] >= 0.0);
     (f64::from(costs[blocksize]), length_array)
+}
+
+/// Appends to `store` the LZ77 data along `path`, with the distances from `m`.
+fn follow_path(
+    store: &mut Lz77Store,
+    m: &MatchCache,
+    in_data: &[u8],
+    instart: usize,
+    path: Vec<u16>,
+) {
+    let mut pos = instart;
+    for length in path.into_iter().rev() {
+        if length >= ZOPFLI_MIN_MATCH as u16 {
+            // The distance the match search finds for this length.
+            let dist = m.dist(pos - instart, length);
+            verify_len_dist(in_data, pos, dist, length);
+            store.lit_len_dist(length, dist, pos);
+            pos += length as usize;
+        } else {
+            store.lit_len_dist(u16::from(in_data[pos]), 0, pos);
+            pos += 1;
+        }
+    }
 }
 
 /// Calculates the optimal path of lz77 lengths to use, from the calculated
@@ -368,31 +428,20 @@ fn trace(size: usize, length_array: &[u16]) -> Vec<u16> {
     path
 }
 
-/// Does a single run for `lz77_optimal`. For good compression, repeated runs
-/// with updated statistics should be performed.
-/// `s`: the block state
-/// `in_data`: the input data array
-/// `instart`: where to start
-/// `inend`: where to stop (not inclusive)
-/// `length_array`: array of size `(inend - instart)` used to store lengths
-/// `costmodel`: function to use as the cost model for this squeeze run
-/// `store`: place to output the LZ77 data
-/// returns the cost that was, according to the `costmodel`, needed to get to the end.
-///     This is not the actual cost.
-#[allow(clippy::too_many_arguments)] // Not feasible to refactor in a more readable way
-fn lz77_optimal_run<F: Fn(usize, u16) -> f64, C: Cache>(
-    lmc: &mut C,
+/// Does a single run for `lz77_optimal`: the shortest path with `costmodel`,
+/// as LZ77 data in `store`.
+fn lz77_optimal_run<F: Fn(usize, u16) -> f64>(
+    m: &MatchCache,
     in_data: &[u8],
     instart: usize,
     inend: usize,
     costmodel: F,
     store: &mut Lz77Store,
-    h: &mut ZopfliHash,
     costs: &mut Vec<f32>,
 ) {
-    let (cost, length_array) = get_best_lengths(lmc, in_data, instart, inend, costmodel, h, costs);
+    let (cost, length_array) = get_best_lengths(m, in_data, instart, inend, costmodel, costs);
     let path = trace(inend - instart, &length_array);
-    store.follow_path(in_data, instart, inend, path, lmc);
+    follow_path(store, m, in_data, instart, path);
     debug_assert!(cost < f64::INFINITY);
 }
 
@@ -404,22 +453,16 @@ fn lz77_optimal_run<F: Fn(usize, u16) -> f64, C: Cache>(
 /// using with a fixed tree.
 /// If `instart` is larger than `0`, it uses values before `instart` as starting
 /// dictionary.
-pub fn lz77_optimal_fixed<C: Cache>(
-    lmc: &mut C,
-    in_data: &[u8],
-    instart: usize,
-    inend: usize,
-    store: &mut Lz77Store,
-) {
-    let mut costs = Vec::with_capacity(inend - instart);
+pub fn lz77_optimal_fixed(in_data: &[u8], instart: usize, inend: usize, store: &mut Lz77Store) {
+    let m = find_matches(in_data, instart, inend);
+    let mut costs = Vec::with_capacity(inend - instart + 1);
     lz77_optimal_run(
-        lmc,
+        &m,
         in_data,
         instart,
         inend,
         get_cost_fixed,
         store,
-        &mut ZopfliHash::new(),
         &mut costs,
     );
 }
@@ -427,8 +470,7 @@ pub fn lz77_optimal_fixed<C: Cache>(
 /// Calculates lit/len and dist pairs for given data.
 /// If `instart` is larger than 0, it uses values before `instart` as starting
 /// dictionary.
-pub fn lz77_optimal<C: Cache>(
-    lmc: &mut C,
+pub fn lz77_optimal(
     in_data: &[u8],
     instart: usize,
     inend: usize,
@@ -439,12 +481,13 @@ pub fn lz77_optimal<C: Cache>(
     let mut currentstore = Lz77Store::new();
     let mut outputstore = currentstore.clone();
 
+    let m = find_matches(in_data, instart, inend);
+
     /* Initial run. */
-    currentstore.greedy(lmc, in_data, instart, inend);
+    currentstore.greedy_from(in_data, instart, inend, |i| m.longest(i - instart));
     let mut stats = SymbolStats::default();
     stats.get_statistics(&currentstore);
 
-    let mut h = ZopfliHash::new();
     let mut costs = Vec::with_capacity(inend - instart + 1);
 
     let mut beststats = SymbolStats::default();
@@ -464,13 +507,12 @@ pub fn lz77_optimal<C: Cache>(
     loop {
         currentstore.reset();
         lz77_optimal_run(
-            lmc,
+            &m,
             in_data,
             instart,
             inend,
             |a, b| get_cost_stat(a, b, &stats),
             &mut currentstore,
-            &mut h,
             &mut costs,
         );
         let cost = calculate_block_size(&currentstore, 0, currentstore.size(), BlockType::Dynamic);

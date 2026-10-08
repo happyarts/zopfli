@@ -56,7 +56,6 @@ use proptest::prelude::*;
 pub use zlib::ZlibEncoder;
 
 mod blocksplitter;
-mod cache;
 mod deflate;
 #[cfg(feature = "gzip")]
 mod gzip;
@@ -66,6 +65,7 @@ mod io;
 mod iter;
 mod katajainen;
 mod lz77;
+mod matches;
 #[cfg(not(feature = "std"))]
 mod math;
 mod squeeze;
@@ -283,5 +283,132 @@ mod test {
             from_trickle == master_blocks,
             "a slow reader gives other chunks"
         );
+    }
+
+    /// Our output and that of the published 0.8.3 for `data`, written in the
+    /// pieces that end at `cuts`.
+    fn ours_and_reference(
+        iteration_count: NonZeroU64,
+        maximum_block_splits: u16,
+        btype: BlockType,
+        data: &[u8],
+        cuts: &[usize],
+    ) -> (Vec<u8>, Vec<u8>) {
+        let mut ours = Vec::new();
+        let mut encoder = DeflateEncoder::new(
+            Options {
+                iteration_count,
+                maximum_block_splits,
+                ..Options::default()
+            },
+            btype,
+            &mut ours,
+        );
+        let reference_btype = match btype {
+            BlockType::Uncompressed => zopfli_reference::BlockType::Uncompressed,
+            BlockType::Fixed => zopfli_reference::BlockType::Fixed,
+            BlockType::Dynamic => zopfli_reference::BlockType::Dynamic,
+        };
+        let mut theirs = Vec::new();
+        let mut reference = zopfli_reference::DeflateEncoder::new(
+            zopfli_reference::Options {
+                iteration_count,
+                maximum_block_splits,
+                ..zopfli_reference::Options::default()
+            },
+            reference_btype,
+            &mut theirs,
+        );
+        // The same pieces to both, empty ones included.
+        let mut last = 0;
+        for &cut in cuts.iter().chain(core::iter::once(&data.len())) {
+            assert_eq!(
+                io::Write::write(&mut encoder, &data[last..cut]).unwrap(),
+                cut - last
+            );
+            assert_eq!(
+                io::Write::write(&mut reference, &data[last..cut]).unwrap(),
+                cut - last
+            );
+            last = cut;
+        }
+        encoder.finish().unwrap();
+        reference.finish().unwrap();
+        (ours, theirs)
+    }
+
+    proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(32))]
+        #[test]
+        fn output_is_that_of_zopfli_0_8_3(
+            iterations in 1..6u64,
+            maximum_block_splits in 0..20u16,
+            btype: BlockType,
+            cuts in prop::collection::vec(0..=1024usize, 0..6),
+            runs in prop::collection::vec((0..6u8, 1..3000usize), 0..60),
+            noise in prop::collection::vec(any::<u8>(), 0..2000),
+        ) {
+            // Runs of a few byte values: many matches and long repetitions of one
+            // byte (the forward pass's shortcut); some random bytes in between.
+            let mut data: Vec<u8> = runs
+                .iter()
+                .flat_map(|&(b, n)| core::iter::repeat_n(b, n))
+                .collect();
+            let at = noise.len() * 7 % (data.len() + 1);
+            data.splice(at..at, noise);
+            let mut cuts: Vec<usize> = cuts.iter().map(|&c| c * data.len() / 1024).collect();
+            cuts.sort_unstable();
+
+            let iteration_count = NonZeroU64::new(iterations).unwrap();
+            let (ours, theirs) =
+                ours_and_reference(iteration_count, maximum_block_splits, btype, &data, &cuts);
+            prop_assert!(ours == theirs);
+        }
+    }
+
+    #[test]
+    fn output_is_that_of_zopfli_0_8_3_on_fixed_inputs() {
+        // The start of each test file, text, data of two and of four byte values
+        // (many distances for each length), and random bytes.
+        let mut inputs: Vec<Vec<u8>> =
+            std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/test/data"))
+                .unwrap()
+                .map(|entry| {
+                    let mut data = std::fs::read(entry.unwrap().path()).unwrap();
+                    data.truncate(100_000);
+                    data
+                })
+                .collect();
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let words = [
+            "zopfli ", "deflate ", "huffman ", "the ", "a ", "block, ", "match.\n",
+        ];
+        inputs.push(
+            (0..8_000)
+                .flat_map(|_| words[random() as usize % words.len()].bytes())
+                .collect(),
+        );
+        inputs.push((0..40_000).map(|_| (random() % 2) as u8).collect());
+        inputs.push(
+            (0..40_000)
+                .map(|_| b"ACGT"[random() as usize % 4])
+                .collect(),
+        );
+        inputs.push((0..40_000).map(|_| random() as u8).collect());
+
+        let iterations = |n| NonZeroU64::new(n).unwrap();
+        for data in &inputs {
+            let (ours, theirs) =
+                ours_and_reference(iterations(2), 15, BlockType::Dynamic, data, &[]);
+            assert!(ours == theirs, "dynamic blocks of {} bytes", data.len());
+            let (ours, theirs) = ours_and_reference(iterations(1), 15, BlockType::Fixed, data, &[]);
+            assert!(ours == theirs, "fixed blocks of {} bytes", data.len());
+        }
     }
 }

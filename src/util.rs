@@ -27,13 +27,6 @@ pub const ZOPFLI_MAX_MATCH: usize = 258;
 /// Minimum length that can be encoded in deflate.
 pub const ZOPFLI_MIN_MATCH: usize = 3;
 
-/// For longest match cache. max 256. Uses huge amounts of memory but makes it
-/// faster. Uses this many times three bytes per single byte of the input data.
-/// This is so because longest match finding has to find the exact distance
-/// that belongs to each length for the best lz77 strategy.
-/// Good values: e.g. 5, 8.
-pub const ZOPFLI_CACHE_LENGTH: usize = 8;
-
 /// limit the max hash chain hits for this hash value. This has an effect only
 /// on files where the hash value is the same very often. On these files, this
 /// gives worse compression (the value should ideally be 32768, which is the

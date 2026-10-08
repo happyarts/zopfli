@@ -109,10 +109,6 @@ impl ZopfliHash {
         addr_of_mut!((*hash).same).write_bytes(0, 1);
     }
 
-    pub fn reset(&mut self) {
-        unsafe { Self::init(NonNull::new(self).unwrap()) }
-    }
-
     pub fn warmup(&mut self, arr: &[u8], pos: usize, end: usize) {
         let c = arr[pos];
         self.update_val(c);

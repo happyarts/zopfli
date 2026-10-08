@@ -35,6 +35,8 @@ log = { version = "0.4.29", optional = true }
 simd-adler32 = { version = "0.3.9", default-features = false, optional = true }
 
 [dev-dependencies]
+# The released crate, to check that the output has not changed.
+zopfli-reference = { package = "zopfli", version = "=0.8.3", default-features = false, features = ["std"] }
 miniz_oxide = "0.9.1"
 proptest = "1.11.0"
 proptest-derive = "0.8.0"
