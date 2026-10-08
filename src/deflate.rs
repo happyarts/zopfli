@@ -1527,6 +1527,8 @@ fn write_block_encoding<W: Write>(
 /// Smooths counts for run-length coding of the code lengths: the core of
 /// Brotli's `OptimizeHuffmanCountsForRle` (24.8 fixed point), as the Efficient
 /// Compression Tool uses it; an alternative to `optimize_huffman_for_rle`.
+/// Ported from Brotli, Copyright (c) 2009, 2010, 2013-2016 by the Brotli
+/// Authors, under the MIT licence in `LICENSE-BROTLI`.
 fn optimize_huffman_for_rle_brotli(counts: &mut [usize]) {
     let n = counts.len();
     let mut length = n;
