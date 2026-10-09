@@ -79,7 +79,7 @@ mod util;
 #[cfg(feature = "zlib")]
 mod zlib;
 
-use core::num::NonZeroU64;
+use core::num::{NonZeroU64, NonZeroUsize};
 #[cfg(all(not(doc), feature = "std"))]
 use std::io::{Error, Write};
 
@@ -142,13 +142,18 @@ pub struct Options {
     /// Compresses the chunks the input arrives in (1 MB with `compress`) on
     /// several threads at once; same output. A chunk goes to a worker thread
     /// with the window before it once the next one arrives; threads start as
-    /// chunks come, up to the available parallelism, and at most twice as many
-    /// chunks as threads are held before a write waits. An error of the sink
+    /// chunks come, up to `chunk_threads` or the available parallelism, and at
+    /// most twice as many chunks as threads are held before a write waits. An error of the sink
     /// can surface on a later call; a write that returns an error has taken
     /// none of its data. Only with the `std` feature and dynamic blocks.
     ///
     /// Default value: false.
     pub parallel_chunks: bool,
+    /// With `parallel_chunks`, at most this many worker threads; `None` for the
+    /// available parallelism.
+    ///
+    /// Default value: `None`.
+    pub chunk_threads: Option<NonZeroUsize>,
     /// Joins neighbouring blocks, also across the chunks the input arrives in,
     /// wherever one block is smaller than the two (at most 16 blocks into one;
     /// blocks stored uncompressed are not joined). Never makes the output
@@ -173,6 +178,7 @@ impl Default for Options {
             code_length_passes: false,
             tree_match_finder: false,
             parallel_chunks: false,
+            chunk_threads: None,
             merge_blocks: false,
         }
     }
@@ -293,6 +299,7 @@ mod test {
         fn parallel_chunks_do_not_change_the_output(
             others: bool,
             merge_blocks: bool,
+            chunk_threads in proptest::option::of(1..4_usize),
             cuts in cuts(),
             runs in runs(6, 3000, 400)
         ) {
@@ -303,6 +310,7 @@ mod test {
                 code_length_passes: others,
                 tree_match_finder: others,
                 parallel_chunks,
+                chunk_threads: chunk_threads.and_then(NonZeroUsize::new),
                 merge_blocks,
                 ..Options::default()
             };

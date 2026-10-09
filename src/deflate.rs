@@ -2006,7 +2006,10 @@ mod chunk_pool {
             let (done_sender, done) = mpsc::channel();
             Self {
                 options,
-                threads: thread::available_parallelism().map_or(1, |n| n.get()),
+                threads: options
+                    .chunk_threads
+                    .or_else(|| thread::available_parallelism().ok())
+                    .map_or(1, |n| n.get()),
                 jobs,
                 queue: Arc::new(Mutex::new(queue)),
                 done_sender,
