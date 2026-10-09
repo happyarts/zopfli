@@ -1,3 +1,5 @@
+// Modified in happyarts/zopfli (see its commit history).
+
 use alloc::vec::Vec;
 use core::{cmp, iter};
 #[cfg(feature = "std")]

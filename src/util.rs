@@ -1,3 +1,5 @@
+// Modified in happyarts/zopfli (see its commit history).
+
 /// Number of distinct literal/length symbols in DEFLATE
 pub const ZOPFLI_NUM_LL: usize = 288;
 /// Number of distinct distance symbols in DEFLATE

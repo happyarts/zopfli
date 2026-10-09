@@ -1,3 +1,5 @@
+// Modified in happyarts/zopfli (see its commit history).
+
 //! The squeeze functions do enhanced LZ77 compression by optimal parsing with a
 //! cost model, rather than greedily choosing the longest length or using a single
 //! step of lazy matching like regular implementations.

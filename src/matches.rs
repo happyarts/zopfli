@@ -1,3 +1,5 @@
+// Added in happyarts/zopfli.
+
 use alloc::vec::Vec;
 
 use crate::util::{ZOPFLI_MAX_MATCH, ZOPFLI_MIN_MATCH};

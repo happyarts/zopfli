@@ -1,3 +1,5 @@
+// Added in happyarts/zopfli.
+
 use alloc::{vec, vec::Vec};
 use core::cmp;
 

@@ -1,3 +1,5 @@
+// Modified in happyarts/zopfli (see its commit history).
+
 #![deny(trivial_casts, trivial_numeric_casts, missing_docs)]
 
 //! A reimplementation of the [Zopfli](https://github.com/google/zopfli) compression library in Rust.
