@@ -329,7 +329,7 @@ fn get_best_lengths<F: Fn(usize, u16) -> f64, C: Cache>(
             // ZOPFLI_MAX_MATCH values to avoid calling ZopfliFindLongestMatch.
 
             for _ in 0..ZOPFLI_MAX_MATCH {
-                costs[j + ZOPFLI_MAX_MATCH] = costs[j] + symbolcost as f32;
+                costs[j + ZOPFLI_MAX_MATCH] = (f64::from(costs[j]) + symbolcost) as f32;
                 length_array[j + ZOPFLI_MAX_MATCH] = ZOPFLI_MAX_MATCH as u16;
                 i += 1;
                 j += 1;
@@ -744,7 +744,7 @@ fn get_best_lengths_cached<F: Fn(usize, u16) -> f64, M: Matches + ?Sized>(
         if m.is_run(j) {
             let symbolcost = costmodel(ZOPFLI_MAX_MATCH, 1);
             for _ in 0..ZOPFLI_MAX_MATCH {
-                costs[j + ZOPFLI_MAX_MATCH] = costs[j] + symbolcost as f32;
+                costs[j + ZOPFLI_MAX_MATCH] = (f64::from(costs[j]) + symbolcost) as f32;
                 length_array[j + ZOPFLI_MAX_MATCH] = ZOPFLI_MAX_MATCH as u16;
                 j += 1;
             }
