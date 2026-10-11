@@ -987,9 +987,9 @@ fn lz77_optimal_with<C: Cache, M: Matches>(
     the statistics of the previous run. */
     /* Repeat statistics with each time the cost model from the previous stat
     run. */
-    let mut current_iteration: u64 = 0;
-    let mut iterations_without_improvement: u64 = 0;
-    loop {
+    let mut iterations_without_improvement = 0;
+    let mut iterations = (0..max_iterations).into_iter().peekable();
+    while let Some(current_iteration) = iterations.next() {
         currentstore.reset();
         let costmodel = |a, b| get_cost_stat(a, b, &stats);
         match matches {
@@ -1009,6 +1009,7 @@ fn lz77_optimal_with<C: Cache, M: Matches>(
 
         if cost < bestcost {
             iterations_without_improvement = 0;
+
             /* Copy to the output store. */
             outputstore.clone_from(&currentstore);
             beststats = stats;
@@ -1016,17 +1017,19 @@ fn lz77_optimal_with<C: Cache, M: Matches>(
 
             debug!("Iteration {current_iteration}: {cost} bit");
         } else {
+            trace!("Iteration {current_iteration}: {cost} bit (no improvement)");
+
             iterations_without_improvement += 1;
-            trace!("Iteration {current_iteration}: {cost} bit");
             if iterations_without_improvement >= max_iterations_without_improvement {
                 break;
             }
         }
-        let iteration = current_iteration;
-        current_iteration += 1;
-        if current_iteration >= max_iterations {
-            break;
+
+        if iterations.peek().is_none() {
+            // No need to update stats or costs if no more iterations follow.
+            continue;
         }
+
         let laststats = stats;
         stats.clear_freqs();
         stats.get_statistics(&currentstore);
@@ -1037,12 +1040,13 @@ fn lz77_optimal_with<C: Cache, M: Matches>(
             stats = add_weighed_stat_freqs(&stats, 1.0, &laststats, 0.5);
             stats.calculate_entropy();
         }
-        if iteration > 5 && (cost - lastcost).abs() < f64::EPSILON {
+        if current_iteration > 5 && (cost - lastcost).abs() < f64::EPSILON {
             stats = beststats;
             stats.randomize_stat_freqs(&mut ran_state);
             stats.calculate_entropy();
-            lastrandomstep = iteration;
+            lastrandomstep = current_iteration;
         }
+
         lastcost = cost;
     }
 
