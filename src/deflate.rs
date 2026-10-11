@@ -438,26 +438,17 @@ pub(crate) fn optimize_huffman_for_rle(counts: &mut [usize]) {
     // Let's not spoil any of the existing good rle codes.
     // Mark any seq of 0's that is longer than 5 as a good_for_rle.
     // Mark any seq of non-0's that is longer than 7 as a good_for_rle.
-    let mut symbol = counts[0];
-    let mut stride = 0;
-    for i in 0..=length {
-        if i == length || counts[i] != symbol {
-            if (symbol == 0 && stride >= 5) || (symbol != 0 && stride >= 7) {
-                for k in 0..stride {
-                    good_for_rle[i - k - 1] = true;
-                }
-            }
-            stride = 1;
-            if i != length {
-                symbol = counts[i];
-            }
-        } else {
-            stride += 1;
+    let mut start = 0;
+    for run in counts[..length].chunk_by(|a, b| a == b) {
+        let symbol = run[0];
+        if (symbol == 0 && run.len() >= 5) || (symbol != 0 && run.len() >= 7) {
+            good_for_rle[start..start + run.len()].fill(true);
         }
+        start += run.len();
     }
 
     // 3) Let's replace those population counts that lead to more rle codes.
-    stride = 0;
+    let mut stride = 0;
     let mut limit = counts[0];
     let mut sum = 0;
     for i in 0..=length {
@@ -1546,20 +1537,12 @@ fn optimize_huffman_for_rle_brotli(counts: &mut [usize]) {
     let at = |counts: &[usize], i: usize| counts.get(i).map_or(0, |&c| c as i64);
 
     let mut good_for_rle = vec![false; length];
-    let mut symbol = counts[0];
-    let mut stride = 0;
-    for i in 0..=length {
-        if i == length || counts[i] != symbol {
-            if (symbol == 0 && stride >= 5) || stride >= 7 {
-                for k in 0..stride {
-                    good_for_rle[i - k - 1] = true;
-                }
-            }
-            stride = 1;
-            symbol = at(counts, i) as usize;
-        } else {
-            stride += 1;
+    let mut start = 0;
+    for run in counts[..length].chunk_by(|a, b| a == b) {
+        if (run[0] == 0 && run.len() >= 5) || run.len() >= 7 {
+            good_for_rle[start..start + run.len()].fill(true);
         }
+        start += run.len();
     }
 
     const STREAK_LIMIT: i64 = 1240;
