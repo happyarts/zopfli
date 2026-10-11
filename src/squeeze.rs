@@ -140,11 +140,17 @@ impl SymbolStats {
     /// DEFLATE.
     fn calculate_entropy(&mut self) {
         fn calculate_and_store_entropy(count: &[usize], bitlengths: &mut [f64]) {
+            // 1 / ln(2) as Zopfli writes it, shorter than `LOG2_E`. Zopfli computes
+            // base 2 logarithms as natural logarithms times this constant, and so do
+            // we, to get the same bit lengths and with them the same costs.
+            #[allow(clippy::approx_constant)]
+            const INV_LN_2: f64 = 1.4426950408889;
+
             let n = count.len();
 
             let sum = count.iter().sum();
 
-            let log2sum = (if sum == 0 { n } else { sum } as f64).log2();
+            let log2sum = (if sum == 0 { n } else { sum } as f64).ln() * INV_LN_2;
 
             for i in 0..n {
                 // When the count of the symbol is 0, but its cost is requested anyway, it
@@ -153,8 +159,14 @@ impl SymbolStats {
                 if count[i] == 0 {
                     bitlengths[i] = log2sum;
                 } else {
-                    bitlengths[i] = log2sum - (count[i] as f64).log2();
+                    bitlengths[i] = log2sum - (count[i] as f64).ln() * INV_LN_2;
                 }
+                // Zopfli clamps results just below zero to zero, which a fused or
+                // extended-precision subtraction can give there. Kept for parity.
+                if bitlengths[i] < 0.0 && bitlengths[i] > -1e-5 {
+                    bitlengths[i] = 0.0;
+                }
+                debug_assert!(bitlengths[i] >= 0.0);
             }
         }
 
